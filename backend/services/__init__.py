@@ -265,3 +265,8 @@ Votre message: *"{message[:100]}{'...' if len(message) > 100 else ''}"*"""
 
 # Singleton instance
 agent_service = AgentService()
+
+# Export TenantLLMService
+from services.llm_service import TenantLLMService
+
+__all__ = ["AgentService", "agent_service", "TenantLLMService"]

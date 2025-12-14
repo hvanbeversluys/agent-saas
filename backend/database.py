@@ -300,6 +300,145 @@ class DBInvoice(Base):
 
 
 # ============================================================
+# 🤖 LLM CONFIGURATION & USAGE
+# ============================================================
+
+class LLMTier(str, Enum):
+    """Tiers de LLM disponibles selon les plans."""
+    FREE = "free"           # Groq uniquement
+    STANDARD = "standard"   # + GPT-4o-mini, Claude Haiku
+    PROFESSIONAL = "professional"  # + GPT-4o, Claude Sonnet
+    ENTERPRISE = "enterprise"  # + Claude Opus, tous modèles
+
+class LLMUsageMode(str, Enum):
+    """Mode d'utilisation des LLM."""
+    PLATFORM = "platform"   # Tokens inclus dans l'abonnement
+    BYOK = "byok"          # Bring Your Own Key
+    HYBRID = "hybrid"      # Platform + BYOK fallback
+
+class DBTenantLLMConfig(Base):
+    """Configuration LLM spécifique à un tenant."""
+    __tablename__ = "tenant_llm_configs"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=False, unique=True)
+    
+    # Mode d'utilisation
+    usage_mode = Column(String(20), default=LLMUsageMode.PLATFORM.value)
+    llm_tier = Column(String(20), default=LLMTier.FREE.value)
+    
+    # Limites mensuelles (mode PLATFORM)
+    monthly_token_limit = Column(Integer, default=100000)  # 100k tokens/mois pour free
+    tokens_used_this_month = Column(Integer, default=0)
+    limit_reset_at = Column(DateTime)
+    
+    # BYOK - Clés API chiffrées du client
+    byok_openai_key = Column(String(500))      # Chiffré
+    byok_anthropic_key = Column(String(500))   # Chiffré
+    byok_groq_key = Column(String(500))        # Chiffré
+    byok_google_key = Column(String(500))      # Chiffré
+    byok_mistral_key = Column(String(500))     # Chiffré
+    
+    # Préférences
+    preferred_provider = Column(String(50))     # openai, anthropic, groq, etc.
+    preferred_model = Column(String(100))       # gpt-4o, claude-3.5-sonnet, etc.
+    default_temperature = Column(Float, default=0.7)
+    
+    # Restrictions
+    allowed_models = Column(JSON, default=list)  # Liste blanche de modèles
+    blocked_models = Column(JSON, default=list)  # Liste noire
+    
+    # Métadonnées
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relations
+    tenant = relationship("DBTenant", backref="llm_config", uselist=False)
+
+
+class DBLLMUsageLog(Base):
+    """Log détaillé de chaque appel LLM pour facturation et analytics."""
+    __tablename__ = "llm_usage_logs"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=False)
+    user_id = Column(String, ForeignKey('users.id'))
+    
+    # Request details
+    provider = Column(String(50), nullable=False)   # openai, anthropic, groq
+    model = Column(String(100), nullable=False)     # gpt-4o, claude-3.5-sonnet
+    
+    # Token usage
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+    
+    # Cost (pour facturation)
+    estimated_cost_usd = Column(Float, default=0.0)
+    
+    # Context
+    agent_id = Column(String)
+    task_type = Column(String(50))  # chat, code, analyze, etc.
+    conversation_id = Column(String)
+    
+    # Performance
+    latency_ms = Column(Float)
+    success = Column(Boolean, default=True)
+    error_message = Column(Text)
+    
+    # Mode utilisé
+    usage_mode = Column(String(20))  # platform, byok
+    
+    # Billing period
+    billing_period = Column(String(7))  # "2024-12"
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Index pour requêtes rapides
+    __table_args__ = (
+        Index('idx_llm_usage_tenant_period', 'tenant_id', 'billing_period'),
+        Index('idx_llm_usage_created', 'created_at'),
+    )
+
+
+# Mapping Plan -> LLM Tier
+PLAN_LLM_TIERS = {
+    SubscriptionPlan.FREE.value: LLMTier.FREE.value,
+    SubscriptionPlan.STARTER.value: LLMTier.STANDARD.value,
+    SubscriptionPlan.BUSINESS.value: LLMTier.PROFESSIONAL.value,
+    SubscriptionPlan.ENTERPRISE.value: LLMTier.ENTERPRISE.value,
+    SubscriptionPlan.CUSTOM.value: LLMTier.ENTERPRISE.value,
+}
+
+# Limites de tokens par plan (par mois)
+PLAN_TOKEN_LIMITS = {
+    SubscriptionPlan.FREE.value: 100_000,        # 100k tokens
+    SubscriptionPlan.STARTER.value: 500_000,     # 500k tokens
+    SubscriptionPlan.BUSINESS.value: 2_000_000,  # 2M tokens
+    SubscriptionPlan.ENTERPRISE.value: 10_000_000,  # 10M tokens
+    SubscriptionPlan.CUSTOM.value: None,         # Illimité
+}
+
+# Prix par token (pour surcharge ou BYOK billing)
+MODEL_PRICING = {
+    # Groq (gratuit pour nous, on facture pas)
+    "llama-3.3-70b-versatile": {"input": 0.0, "output": 0.0},
+    "llama-3.1-8b-instant": {"input": 0.0, "output": 0.0},
+    "mixtral-8x7b-32768": {"input": 0.0, "output": 0.0},
+    
+    # OpenAI (prix par 1M tokens)
+    "gpt-4o": {"input": 5.0, "output": 15.0},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4-turbo": {"input": 10.0, "output": 30.0},
+    
+    # Anthropic (prix par 1M tokens)
+    "claude-3-5-sonnet-20241022": {"input": 3.0, "output": 15.0},
+    "claude-3-5-haiku-20241022": {"input": 0.25, "output": 1.25},
+    "claude-3-opus-20240229": {"input": 15.0, "output": 75.0},
+}
+
+
+# ============================================================
 # 🔑 PERMISSIONS SYSTEM
 # ============================================================
 

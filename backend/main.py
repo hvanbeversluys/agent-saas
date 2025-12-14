@@ -6,7 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
@@ -452,6 +452,253 @@ def llm_status():
     """Get LLM providers status and available models."""
     from services import agent_service
     return agent_service.get_status()
+
+
+# ============================================================
+# 🤖 LLM CONFIGURATION ENDPOINTS
+# ============================================================
+
+class LLMConfigResponse(BaseModel):
+    """Response for LLM configuration."""
+    usage_mode: str
+    llm_tier: str
+    monthly_token_limit: Optional[int]
+    tokens_used_this_month: int
+    limit_reset_at: Optional[str]
+    has_byok_keys: Dict[str, bool]
+    preferred_provider: Optional[str]
+    preferred_model: Optional[str]
+    available_models: List[Dict[str, str]]
+
+class LLMConfigUpdate(BaseModel):
+    """Request to update LLM configuration."""
+    usage_mode: Optional[str] = None  # platform, byok, hybrid
+    byok_openai_key: Optional[str] = None
+    byok_anthropic_key: Optional[str] = None
+    byok_groq_key: Optional[str] = None
+    preferred_provider: Optional[str] = None
+    preferred_model: Optional[str] = None
+
+class LLMUsageResponse(BaseModel):
+    """Response for LLM usage stats."""
+    period: str
+    total_tokens: int
+    total_cost_usd: float
+    total_calls: int
+    by_model: Dict[str, Dict[str, Any]]
+    limit: Optional[int]
+    remaining: Optional[int]
+    tier: str
+    mode: str
+
+@app.get("/api/llm/config", response_model=LLMConfigResponse)
+def get_llm_config(
+    current_user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get LLM configuration for current tenant."""
+    from services.llm_service import TenantLLMService
+    
+    service = TenantLLMService(db)
+    config = service.get_tenant_config(current_user.tenant_id)
+    available_models = service.get_available_models(current_user.tenant_id)
+    
+    return LLMConfigResponse(
+        usage_mode=config.usage_mode,
+        llm_tier=config.llm_tier,
+        monthly_token_limit=config.monthly_token_limit,
+        tokens_used_this_month=config.tokens_used_this_month,
+        limit_reset_at=config.limit_reset_at.isoformat() if config.limit_reset_at else None,
+        has_byok_keys={
+            "openai": bool(config.byok_openai_key),
+            "anthropic": bool(config.byok_anthropic_key),
+            "groq": bool(config.byok_groq_key),
+            "google": bool(config.byok_google_key),
+            "mistral": bool(config.byok_mistral_key),
+        },
+        preferred_provider=config.preferred_provider,
+        preferred_model=config.preferred_model,
+        available_models=available_models,
+    )
+
+@app.put("/api/llm/config", response_model=LLMConfigResponse)
+def update_llm_config(
+    data: LLMConfigUpdate,
+    current_user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update LLM configuration for current tenant. Requires admin role."""
+    from services.llm_service import TenantLLMService
+    
+    # Check permission (admin or owner only)
+    if current_user.role not in ["owner", "admin"]:
+        raise HTTPException(status_code=403, detail="Permission denied")
+    
+    service = TenantLLMService(db)
+    config = service.update_config(
+        tenant_id=current_user.tenant_id,
+        usage_mode=data.usage_mode,
+        byok_openai_key=data.byok_openai_key,
+        byok_anthropic_key=data.byok_anthropic_key,
+        byok_groq_key=data.byok_groq_key,
+        preferred_provider=data.preferred_provider,
+        preferred_model=data.preferred_model,
+    )
+    available_models = service.get_available_models(current_user.tenant_id)
+    
+    return LLMConfigResponse(
+        usage_mode=config.usage_mode,
+        llm_tier=config.llm_tier,
+        monthly_token_limit=config.monthly_token_limit,
+        tokens_used_this_month=config.tokens_used_this_month,
+        limit_reset_at=config.limit_reset_at.isoformat() if config.limit_reset_at else None,
+        has_byok_keys={
+            "openai": bool(config.byok_openai_key),
+            "anthropic": bool(config.byok_anthropic_key),
+            "groq": bool(config.byok_groq_key),
+            "google": bool(config.byok_google_key),
+            "mistral": bool(config.byok_mistral_key),
+        },
+        preferred_provider=config.preferred_provider,
+        preferred_model=config.preferred_model,
+        available_models=available_models,
+    )
+
+@app.get("/api/llm/usage", response_model=LLMUsageResponse)
+def get_llm_usage(
+    period: Optional[str] = None,
+    current_user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get LLM usage statistics for current tenant."""
+    from services.llm_service import TenantLLMService
+    
+    service = TenantLLMService(db)
+    stats = service.get_usage_stats(current_user.tenant_id, period)
+    
+    return LLMUsageResponse(**stats)
+
+@app.get("/api/llm/models")
+def get_available_models(
+    current_user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get available LLM models for current tenant based on their plan."""
+    from services.llm_service import TenantLLMService, TIER_MODELS
+    from database import LLMTier, MODEL_PRICING
+    
+    service = TenantLLMService(db)
+    config = service.get_tenant_config(current_user.tenant_id)
+    available = service.get_available_models(current_user.tenant_id)
+    
+    # Add pricing info
+    models_with_pricing = []
+    for model_info in available:
+        pricing = MODEL_PRICING.get(model_info["model"], {"input": 0, "output": 0})
+        models_with_pricing.append({
+            **model_info,
+            "pricing": {
+                "input_per_1m": pricing["input"],
+                "output_per_1m": pricing["output"],
+                "is_free": pricing["input"] == 0 and pricing["output"] == 0,
+            }
+        })
+    
+    return {
+        "tier": config.llm_tier,
+        "mode": config.usage_mode,
+        "models": models_with_pricing,
+        "all_tiers": {
+            tier: [{"provider": p, "model": m} for p, m in models]
+            for tier, models in TIER_MODELS.items()
+        }
+    }
+
+@app.get("/api/llm/plans")
+def get_llm_plans():
+    """Get available LLM plans and their features (public endpoint)."""
+    from database import PLAN_TOKEN_LIMITS, PLAN_LLM_TIERS, MODEL_PRICING
+    from services.llm_service import TIER_MODELS
+    
+    plans = [
+        {
+            "id": "free",
+            "name": "Gratuit",
+            "price_monthly": 0,
+            "price_yearly": 0,
+            "features": [
+                "100,000 tokens/mois",
+                "Modèles Groq (Llama 3.3, Mixtral)",
+                "Réponses rapides",
+                "Support communautaire",
+            ],
+            "llm_tier": "free",
+            "token_limit": 100_000,
+            "models": [m for _, m in TIER_MODELS["free"]],
+        },
+        {
+            "id": "starter",
+            "name": "Starter",
+            "price_monthly": 29,
+            "price_yearly": 290,
+            "features": [
+                "500,000 tokens/mois",
+                "GPT-4o-mini, Claude Haiku",
+                "Support email",
+                "3 utilisateurs",
+            ],
+            "llm_tier": "standard",
+            "token_limit": 500_000,
+            "models": [m for _, m in TIER_MODELS["standard"]],
+            "popular": False,
+        },
+        {
+            "id": "business",
+            "name": "Business",
+            "price_monthly": 99,
+            "price_yearly": 990,
+            "features": [
+                "2,000,000 tokens/mois",
+                "GPT-4o, Claude Sonnet",
+                "Support prioritaire",
+                "10 utilisateurs",
+                "BYOK (vos propres clés)",
+                "Analytics avancés",
+            ],
+            "llm_tier": "professional",
+            "token_limit": 2_000_000,
+            "models": [m for _, m in TIER_MODELS["professional"]],
+            "popular": True,
+        },
+        {
+            "id": "enterprise",
+            "name": "Enterprise",
+            "price_monthly": 299,
+            "price_yearly": 2990,
+            "features": [
+                "10,000,000 tokens/mois",
+                "Tous les modèles (Claude Opus, GPT-4 Turbo)",
+                "Support dédié 24/7",
+                "Utilisateurs illimités",
+                "BYOK",
+                "SLA 99.9%",
+                "On-premise disponible",
+            ],
+            "llm_tier": "enterprise",
+            "token_limit": 10_000_000,
+            "models": [m for _, m in TIER_MODELS["enterprise"]],
+            "popular": False,
+        },
+    ]
+    
+    return {
+        "plans": plans,
+        "byok_info": {
+            "description": "Bring Your Own Key - Utilisez vos propres clés API pour un contrôle total des coûts",
+            "supported_providers": ["OpenAI", "Anthropic", "Groq", "Google", "Mistral"],
+            "available_from": "business",
+        }
+    }
 
 
 # ============================================================
