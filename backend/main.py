@@ -449,6 +449,223 @@ def health_check():
         "environment": settings.ENVIRONMENT
     }
 
+
+# ============================================================
+# 🔒 INTERNAL API (Worker only)
+# ============================================================
+# Ces endpoints sont utilisés par le worker pour récupérer les données
+# et mettre à jour les statuts. Ils nécessitent une clé API interne.
+
+def verify_internal_api_key(
+    request: Request,
+) -> bool:
+    """Vérifie la clé API interne pour les endpoints worker."""
+    # En dev, on accepte tout
+    if settings.is_development:
+        return True
+    
+    api_key = request.headers.get("X-Internal-API-Key")
+    if not api_key or api_key != settings.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid internal API key")
+    return True
+
+
+# --- Internal: Workflows ---
+
+@app.get("/api/internal/workflows/{workflow_id}")
+def internal_get_workflow(
+    workflow_id: str,
+    _: bool = Depends(verify_internal_api_key),
+    db: Session = Depends(get_db)
+):
+    """[Internal] Récupère un workflow complet pour le worker."""
+    workflow = db.query(DBWorkflow).filter(DBWorkflow.id == workflow_id).first()
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    
+    return {
+        "id": workflow.id,
+        "tenant_id": workflow.tenant_id,
+        "name": workflow.name,
+        "description": workflow.description,
+        "agent_id": workflow.agent_id,
+        "trigger_type": workflow.trigger_type,
+        "trigger_config": workflow.trigger_config,
+        "input_schema": workflow.input_schema,
+        "output_schema": workflow.output_schema,
+        "is_active": workflow.is_active,
+    }
+
+
+@app.get("/api/internal/workflows/{workflow_id}/tasks")
+def internal_get_workflow_tasks(
+    workflow_id: str,
+    _: bool = Depends(verify_internal_api_key),
+    db: Session = Depends(get_db)
+):
+    """[Internal] Récupère les tâches d'un workflow ordonnées."""
+    tasks = db.query(DBWorkflowTask).filter(
+        DBWorkflowTask.workflow_id == workflow_id
+    ).order_by(DBWorkflowTask.order).all()
+    
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "task_type": t.task_type,
+            "config": t.config,
+            "order": t.order,
+            "next_task_on_success": t.next_task_on_success,
+            "next_task_on_failure": t.next_task_on_failure,
+        }
+        for t in tasks
+    ]
+
+
+# --- Internal: Executions ---
+
+class InternalExecutionUpdate(BaseModel):
+    status: str
+    current_task_order: Optional[str] = None
+    output_data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+@app.patch("/api/internal/executions/{execution_id}")
+def internal_update_execution(
+    execution_id: str,
+    update: InternalExecutionUpdate,
+    _: bool = Depends(verify_internal_api_key),
+    db: Session = Depends(get_db)
+):
+    """[Internal] Met à jour le statut d'une exécution (callback worker)."""
+    execution = db.query(DBWorkflowExecution).filter(
+        DBWorkflowExecution.id == execution_id
+    ).first()
+    
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    
+    execution.status = update.status
+    
+    if update.current_task_order:
+        execution.current_task_order = update.current_task_order
+    
+    if update.output_data:
+        execution.output_data = update.output_data
+    
+    if update.error:
+        execution.error = update.error
+    
+    if update.status in ["completed", "failed", "cancelled"]:
+        execution.completed_at = datetime.utcnow()
+    
+    db.commit()
+    
+    logger.info(
+        "execution_updated_by_worker",
+        execution_id=execution_id,
+        status=update.status
+    )
+    
+    return {"message": "Updated", "status": execution.status}
+
+
+# --- Internal: Agents ---
+
+@app.get("/api/internal/agents/{agent_id}")
+def internal_get_agent(
+    agent_id: str,
+    _: bool = Depends(verify_internal_api_key),
+    db: Session = Depends(get_db)
+):
+    """[Internal] Récupère un agent avec son système prompt et tools."""
+    agent = db.query(DBAgent).filter(DBAgent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    return {
+        "id": agent.id,
+        "tenant_id": agent.tenant_id,
+        "name": agent.name,
+        "description": agent.description,
+        "system_prompt": agent.system_prompt,
+        "scope": agent.scope,
+        "tools": [
+            {"id": t.id, "name": t.name, "type": t.tool_type, "config": t.config}
+            for t in agent.mcp_tools
+        ],
+        "prompts": [
+            {"id": p.id, "name": p.name, "content": p.content}
+            for p in agent.prompts
+        ]
+    }
+
+
+# --- Internal: Prompts ---
+
+@app.get("/api/internal/prompts/{prompt_id}")
+def internal_get_prompt(
+    prompt_id: str,
+    _: bool = Depends(verify_internal_api_key),
+    db: Session = Depends(get_db)
+):
+    """[Internal] Récupère un prompt avec ses variables."""
+    prompt = db.query(DBPrompt).filter(DBPrompt.id == prompt_id).first()
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+    
+    return {
+        "id": prompt.id,
+        "tenant_id": prompt.tenant_id,
+        "name": prompt.name,
+        "content": prompt.content,
+        "variables": prompt.variables,
+        "category": prompt.category,
+        "mcp_tool_id": prompt.mcp_tool_id,
+    }
+
+
+# --- Internal: Tenant LLM Config ---
+
+@app.get("/api/internal/tenants/{tenant_id}/llm-config")
+def internal_get_tenant_llm_config(
+    tenant_id: str,
+    _: bool = Depends(verify_internal_api_key),
+    db: Session = Depends(get_db)
+):
+    """[Internal] Récupère la config LLM d'un tenant pour le worker."""
+    tenant = db.query(DBTenant).filter(DBTenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    tenant_settings = tenant.settings or {}
+    llm_config = tenant_settings.get("llm", {})
+    
+    # Récupérer les clés BYOK si configurées
+    byok_keys = {}
+    if llm_config.get("usage_mode") in ["byok", "hybrid"]:
+        byok_keys = {
+            "openai": llm_config.get("byok_openai_key"),
+            "anthropic": llm_config.get("byok_anthropic_key"),
+            "groq": llm_config.get("byok_groq_key"),
+        }
+    
+    return {
+        "tenant_id": tenant_id,
+        "plan": tenant.plan,
+        "usage_mode": llm_config.get("usage_mode", "platform"),
+        "llm_tier": llm_config.get("llm_tier", "free"),
+        "preferred_provider": llm_config.get("preferred_provider"),
+        "preferred_model": llm_config.get("preferred_model"),
+        "byok_keys": byok_keys,
+        # Platform keys fallback
+        "platform_groq_key": settings.GROQ_API_KEY,
+        "platform_openai_key": settings.OPENAI_API_KEY,
+        "platform_anthropic_key": settings.ANTHROPIC_API_KEY,
+    }
+
+
 @app.get("/api/llm/status")
 def llm_status():
     """Get LLM providers status and available models."""

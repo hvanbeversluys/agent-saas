@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     STRIPE_PRICE_BUSINESS: str | None = None
     STRIPE_PRICE_ENTERPRISE: str | None = None
     
+    # === Internal API (Worker communication) ===
+    INTERNAL_API_KEY: str | None = None  # Clé pour endpoints /api/internal/*
+    
     # === Feature Flags ===
     FEATURE_MFA_ENABLED: bool = False
     FEATURE_BILLING_ENABLED: bool = False

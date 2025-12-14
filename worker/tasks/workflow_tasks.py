@@ -199,9 +199,9 @@ async def execute_workflow_step(
 async def execute_llm_step(
     config: Dict[str, Any],
     context: Dict[str, Any],
+    tenant_id: str = None,
 ) -> str:
-    """Execute LLM generation step."""
-    from langchain_groq import ChatGroq
+    """Execute LLM generation step with tenant-specific config."""
     from langchain_core.messages import HumanMessage
     
     prompt = config.get("prompt", "")
@@ -210,11 +210,29 @@ async def execute_llm_step(
     for key, value in context.items():
         prompt = prompt.replace(f"{{{key}}}", str(value))
     
-    llm = ChatGroq(
-        api_key=settings.GROQ_API_KEY,
-        model=config.get("model", "llama-3.3-70b-versatile"),
-        temperature=config.get("temperature", 0.7),
+    # Get tenant LLM config
+    api_key, provider, model = await get_llm_for_tenant(tenant_id) if tenant_id else (
+        settings.GROQ_API_KEY, "groq", "llama-3.3-70b-versatile"
     )
+    
+    # Override model if specified in config
+    model = config.get("model", model)
+    temperature = config.get("temperature", 0.7)
+    
+    # Create LLM based on provider
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(api_key=api_key, model=model, temperature=temperature)
+    elif provider == "openai":
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
+    elif provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        llm = ChatAnthropic(api_key=api_key, model=model, temperature=temperature)
+    else:
+        # Fallback Groq
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(api_key=api_key, model=model, temperature=temperature)
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
     return response.content
@@ -301,33 +319,25 @@ async def load_workflow_from_backend(
     workflow_id: str,
     tenant_id: str,
 ) -> Optional[Dict[str, Any]]:
-    """Load workflow definition from backend API."""
-    import httpx
+    """Load workflow definition from backend API using BackendClient."""
+    from services.backend_client import get_backend_client
+    
+    client = get_backend_client()
     
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{settings.BACKEND_URL}/api/workflows/{workflow_id}",
-                headers={
-                    "X-Tenant-ID": tenant_id,
-                    "Authorization": f"Bearer {settings.BACKEND_API_KEY}",
-                } if settings.BACKEND_API_KEY else {"X-Tenant-ID": tenant_id},
-                timeout=10.0,
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 404:
-                return None
-            else:
-                logger.error(
-                    "Failed to load workflow",
-                    status_code=response.status_code,
-                )
-                return None
-                
+        # Get workflow
+        workflow = await client.get_workflow(workflow_id)
+        if not workflow:
+            return None
+        
+        # Get tasks
+        tasks = await client.get_workflow_tasks(workflow_id)
+        workflow["tasks"] = tasks
+        
+        return workflow
+        
     except Exception as e:
-        logger.error("Backend request failed", error=str(e))
+        logger.error("Failed to load workflow", error=str(e))
         return None
 
 
@@ -337,19 +347,16 @@ async def notify_workflow_completed(
     execution_id: str,
     result: Dict[str, Any],
 ):
-    """Notify backend of workflow completion."""
-    import httpx
+    """Notify backend of workflow completion via BackendClient."""
+    from services.backend_client import get_backend_client
     
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{settings.BACKEND_URL}/api/workflows/{workflow_id}/executions/{execution_id}/complete",
-                headers={"X-Tenant-ID": tenant_id},
-                json=result,
-                timeout=10.0,
-            )
-    except Exception as e:
-        logger.error("Failed to notify completion", error=str(e))
+    client = get_backend_client()
+    
+    await client.complete_execution(
+        execution_id=execution_id,
+        output=result.get("output_data", {}),
+        success=True
+    )
 
 
 async def notify_workflow_failed(
@@ -358,16 +365,50 @@ async def notify_workflow_failed(
     execution_id: str,
     error: str,
 ):
-    """Notify backend of workflow failure."""
-    import httpx
+    """Notify backend of workflow failure via BackendClient."""
+    from services.backend_client import get_backend_client
     
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{settings.BACKEND_URL}/api/workflows/{workflow_id}/executions/{execution_id}/fail",
-                headers={"X-Tenant-ID": tenant_id},
-                json={"error": error},
-                timeout=10.0,
-            )
-    except Exception as e:
-        logger.error("Failed to notify failure", error=str(e))
+    client = get_backend_client()
+    
+    await client.fail_execution(
+        execution_id=execution_id,
+        error=error
+    )
+
+
+async def get_llm_for_tenant(tenant_id: str) -> tuple[str, str, str]:
+    """
+    Récupère la config LLM pour un tenant.
+    
+    Returns:
+        (api_key, provider, model)
+    """
+    from services.backend_client import get_backend_client
+    
+    client = get_backend_client()
+    config = await client.get_tenant_llm_config(tenant_id)
+    
+    if not config:
+        # Fallback sur les settings du worker
+        return (settings.GROQ_API_KEY, "groq", "llama-3.3-70b-versatile")
+    
+    usage_mode = config.get("usage_mode", "platform")
+    byok_keys = config.get("byok_keys", {})
+    
+    # BYOK mode: utiliser les clés du tenant
+    if usage_mode in ["byok", "hybrid"] and byok_keys:
+        if byok_keys.get("groq"):
+            return (byok_keys["groq"], "groq", "llama-3.3-70b-versatile")
+        if byok_keys.get("openai"):
+            return (byok_keys["openai"], "openai", "gpt-4o-mini")
+        if byok_keys.get("anthropic"):
+            return (byok_keys["anthropic"], "anthropic", "claude-3-haiku-20240307")
+    
+    # Platform mode: utiliser les clés de la plateforme
+    if config.get("platform_groq_key"):
+        return (config["platform_groq_key"], "groq", "llama-3.3-70b-versatile")
+    if config.get("platform_openai_key"):
+        return (config["platform_openai_key"], "openai", "gpt-4o-mini")
+    
+    # Ultimate fallback
+    return (settings.GROQ_API_KEY, "groq", "llama-3.3-70b-versatile")

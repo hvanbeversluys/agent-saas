@@ -215,28 +215,40 @@ async def cleanup_old_executions(ctx: Dict[str, Any]):
 
 async def startup(ctx: Dict[str, Any]):
     """Worker startup hook."""
+    from services.backend_client import get_backend_client
+    
     logger.info(
         "Worker starting",
         service=settings.SERVICE_NAME,
         version=settings.VERSION,
         environment=settings.ENVIRONMENT,
         max_jobs=settings.MAX_JOBS,
+        backend_url=settings.BACKEND_URL,
     )
     
-    # Initialize database connection pool (read-only)
-    # ctx["db"] = await create_db_pool()
+    # Verify backend connectivity
+    client = get_backend_client()
+    backend_healthy = await client.health_check()
     
-    # Initialize LLM providers
-    # ctx["llm_providers"] = initialize_llm_providers()
+    if backend_healthy:
+        logger.info("Backend connection verified")
+    else:
+        logger.warning(
+            "Backend not reachable - will retry on task execution",
+            backend_url=settings.BACKEND_URL
+        )
+    
+    # Store client in context for tasks
+    ctx["backend_client"] = client
 
 
 async def shutdown(ctx: Dict[str, Any]):
     """Worker shutdown hook."""
     logger.info("Worker shutting down")
     
-    # Cleanup resources
-    # if "db" in ctx:
-    #     await ctx["db"].close()
+    # Close backend client
+    if "backend_client" in ctx:
+        await ctx["backend_client"].close()
 
 
 # ============================================================
