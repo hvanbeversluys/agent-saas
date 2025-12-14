@@ -447,6 +447,12 @@ def health_check():
         "environment": settings.ENVIRONMENT
     }
 
+@app.get("/api/llm/status")
+def llm_status():
+    """Get LLM providers status and available models."""
+    from services import agent_service
+    return agent_service.get_status()
+
 
 # ============================================================
 # 🔐 AUTH ENDPOINTS
@@ -1538,8 +1544,9 @@ def detect_best_agent(message: str, agents: list, current_agent_id: str = None) 
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(request: ChatRequest, db: Session = Depends(get_db)):
-    """Chat avec orchestration intelligente et handoff"""
+async def chat(request: ChatRequest, db: Session = Depends(get_db)):
+    """Chat avec orchestration intelligente, handoff et LLM réel."""
+    from services import agent_service
     
     # Récupérer ou créer la conversation
     conv_id = request.conversation_id or str(generate_uuid())
@@ -1587,12 +1594,55 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
                 # Mettre à jour la conversation avec le nouvel agent
                 conversation.agent_id = target_agent.id
     
-    # Générer la réponse
-    response_content = generate_orchestrated_response(
-        request.message, 
-        response_agent, 
-        handoff_info
-    )
+    # Générer la réponse avec LLM si disponible
+    if agent_service.is_available and response_agent:
+        # Préparer la config de l'agent
+        agent_config = {
+            "name": response_agent.name,
+            "icon": response_agent.icon,
+            "description": response_agent.description,
+            "system_prompt": response_agent.system_prompt or "",
+            "mcp_tools": [{"name": t.name, "description": t.description} for t in response_agent.mcp_tools] if response_agent.mcp_tools else [],
+        }
+        
+        # Filtrer l'historique (derniers 10 messages pour limiter les tokens)
+        history = messages[-10:-1] if len(messages) > 1 else []
+        
+        # Détecter le type de tâche
+        task_type = agent_service.detect_task_type(request.message)
+        
+        # Appeler le LLM
+        try:
+            llm_response = await agent_service.chat(
+                message=request.message,
+                agent_config=agent_config,
+                conversation_history=history,
+                task_type=task_type,
+            )
+            response_content = llm_response["content"]
+            
+            # Log usage for billing
+            logger.info(
+                "LLM chat completed",
+                agent_id=response_agent.id if response_agent else None,
+                model=llm_response.get("model"),
+                tokens=llm_response.get("usage", {}).get("total_tokens", 0),
+            )
+        except Exception as e:
+            logger.error("LLM chat failed, using fallback", error=str(e))
+            response_content = generate_orchestrated_response(
+                request.message, 
+                response_agent, 
+                handoff_info
+            )
+    else:
+        # Fallback: réponse statique
+        response_content = generate_orchestrated_response(
+            request.message, 
+            response_agent, 
+            handoff_info
+        )
+    
     messages.append({"role": "assistant", "content": response_content})
     
     # Sauvegarder
@@ -1608,7 +1658,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
 
 
 def generate_orchestrated_response(user_message: str, agent: DBAgent = None, handoff: HandoffInfo = None) -> str:
-    """Génère une réponse avec contexte d'orchestration"""
+    """Génère une réponse statique (fallback quand pas de LLM)."""
     user_lower = user_message.lower()
     
     # Si handoff déclenché

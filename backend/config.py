@@ -51,8 +51,18 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = "noreply@agent-saas.com"
     
     # === LLM Providers ===
+    # Free/Cheap providers first
+    GROQ_API_KEY: str | None = None      # FREE! https://console.groq.com/
+    GOOGLE_API_KEY: str | None = None    # Free tier available
+    MISTRAL_API_KEY: str | None = None   # Free tier available
+    
+    # Paid providers
     OPENAI_API_KEY: str | None = None
     ANTHROPIC_API_KEY: str | None = None
+    
+    # LLM Router settings
+    LLM_DEFAULT_TIER: str = "free"       # free, cheap, balanced, premium
+    LLM_DEFAULT_PROVIDER: str | None = None  # Force a specific provider
     
     # === Stripe (Billing) ===
     STRIPE_SECRET_KEY: str | None = None
