@@ -1,40 +1,43 @@
 """
-Database configuration avec SQLite pour le MVP.
-Facilement migrable vers PostgreSQL plus tard.
+Database configuration - V1 Production Ready.
+Supporte SQLite (dev) et PostgreSQL (prod) via configuration.
 """
-from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, JSON, ForeignKey, Table, Integer, Float, Enum as SQLEnum
+from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, JSON, ForeignKey, Table, Integer, Float, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, timedelta
 from enum import Enum
 import uuid
-import secrets
-import hashlib
 
-# SQLite database (fichier local)
-DATABASE_URL = "sqlite:///./agent_saas.db"
+from config import settings
 
-engine = create_engine(
-    DATABASE_URL, 
-    connect_args={"check_same_thread": False}  # Nécessaire pour SQLite avec FastAPI
-)
+# Database URL depuis la configuration
+DATABASE_URL = settings.DATABASE_URL
+
+# Configuration du moteur selon le type de base
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        echo=settings.DATABASE_ECHO
+    )
+else:
+    # PostgreSQL ou autre
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True,
+        echo=settings.DATABASE_ECHO
+    )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
 # --- Helper pour générer des UUIDs ---
 def generate_uuid():
     return str(uuid.uuid4())
-
-def hash_password(password: str) -> str:
-    """Hash simple pour le MVP - utiliser bcrypt en prod"""
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_password(password: str, hashed: str) -> bool:
-    return hash_password(password) == hashed
-
-def generate_api_key():
-    return f"ask_{secrets.token_urlsafe(32)}"
 
 
 # ============================================================

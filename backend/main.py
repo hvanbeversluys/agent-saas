@@ -1,55 +1,121 @@
 """
-Agent SaaS API - Backend avec SQLite
-MVP avec CRUD complet pour agents, prompts et MCP tools
-+ Auth JWT + Multi-tenancy
+Agent SaaS API - V1 Production Ready
+Multi-tenant SaaS platform for AI employees management.
 """
-from fastapi import FastAPI, Depends, HTTPException, status, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from sqlalchemy.orm import Session
-import uuid
 from datetime import datetime, timedelta
-import jwt
-import os
+from contextlib import asynccontextmanager
+import structlog
 
+# Configuration & Security
+from config import settings
+from security import (
+    hash_password, verify_password, generate_api_key, generate_uuid,
+    create_access_token, create_refresh_token, decode_token,
+    security, require_permission, check_permission, slugify,
+    ROLE_PERMISSIONS, PERMISSIONS
+)
+
+# Database
 from database import (
     init_db, get_db, seed_demo_data,
     DBAgent, DBPrompt, DBMCPTool, DBConversation,
     DBWorkflow, DBWorkflowTask, DBWorkflowExecution, DBScheduledJob,
     DBFunctionalArea,
-    # Auth & Multi-tenancy
     DBTenant, DBUser, DBSession, DBAPIKey,
     DBUsageRecord, DBInvoice,
     SubscriptionPlan, SubscriptionStatus, UserRole,
-    ROLE_PERMISSIONS, PERMISSIONS,
-    hash_password, verify_password, generate_api_key, generate_uuid
 )
 
-# --- JWT Configuration ---
-JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production-1234567890")
-JWT_ALGORITHM = "HS256"
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60
-JWT_REFRESH_TOKEN_EXPIRE_DAYS = 30
+# Logging structuré
+logger = structlog.get_logger()
 
-security = HTTPBearer(auto_error=False)
 
-app = FastAPI(title="Agent SaaS API", version="0.3.0")
+# === Application Lifecycle ===
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events"""
+    # Startup
+    logger.info("Starting Agent SaaS API", version=settings.APP_VERSION, env=settings.ENVIRONMENT)
+    init_db()
+    
+    # Seed demo data only in development
+    if settings.is_development:
+        db = next(get_db())
+        seed_demo_data(db)
+        db.close()
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down Agent SaaS API")
 
-# Configuration CORS
+
+# === FastAPI Application ===
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="Multi-tenant SaaS platform for AI employees management",
+    docs_url="/docs" if settings.DEBUG else None,
+    redoc_url="/redoc" if settings.DEBUG else None,
+    lifespan=lifespan
+)
+
+
+# === Middleware ===
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS if settings.is_production else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# === Exception Handlers ===
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(
+        "HTTP error",
+        status_code=exc.status_code,
+        detail=exc.detail,
+        path=request.url.path
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "status_code": exc.status_code}
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        "Unhandled exception",
+        error=str(exc),
+        path=request.url.path,
+        exc_info=True
+    )
+    if settings.DEBUG:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(exc), "type": type(exc).__name__}
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
+
+
 # --- Pydantic Schemas ---
 
 class MCPToolBase(BaseModel):
-    name: str
+    name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = ""
     icon: str = "🔌"
     category: str = "general"
@@ -62,7 +128,7 @@ class MCPToolCreate(MCPToolBase):
     pass
 
 class MCPToolUpdate(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = None
     icon: Optional[str] = None
     category: Optional[str] = None
@@ -320,43 +386,11 @@ class UsageStatsResponse(BaseModel):
 
 
 # ============================================================
-# 🔐 AUTH HELPERS
+# 🔐 AUTH HELPERS (Dependencies)
 # ============================================================
 
-def create_access_token(user_id: str, tenant_id: str) -> str:
-    """Crée un JWT access token"""
-    expires = datetime.utcnow() + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {
-        "sub": user_id,
-        "tenant_id": tenant_id,
-        "exp": expires,
-        "type": "access"
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def create_refresh_token(user_id: str) -> str:
-    """Crée un refresh token"""
-    expires = datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
-    payload = {
-        "sub": user_id,
-        "exp": expires,
-        "type": "refresh",
-        "jti": generate_uuid()  # Unique ID pour révocation
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-def decode_token(token: str) -> dict:
-    """Décode et valide un JWT"""
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expiré")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token invalide")
-
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> DBUser:
     """Dependency pour récupérer l'utilisateur authentifié"""
@@ -378,7 +412,7 @@ def get_current_user(
     return user
 
 def get_optional_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> Optional[DBUser]:
     """Dependency optionnelle - retourne None si pas authentifié"""
@@ -394,66 +428,24 @@ def get_optional_user(
     except:
         return None
 
-def check_permission(user: DBUser, resource: str, action: str) -> bool:
-    """Vérifie si l'utilisateur a la permission"""
-    role_perms = ROLE_PERMISSIONS.get(user.role, [])
-    
-    # Owner a tous les droits
-    if role_perms == "*":
-        return True
-    
-    # Vérifier permission exacte ou wildcard
-    full_perm = f"{resource}:{action}"
-    wildcard_perm = f"{resource}:*"
-    
-    if full_perm in role_perms or wildcard_perm in role_perms:
-        return True
-    
-    # Vérifier permissions additionnelles
-    if user.permissions and full_perm in user.permissions:
-        return True
-    
-    return False
-
-def require_permission(resource: str, action: str):
-    """Décorateur/Dependency pour vérifier les permissions"""
-    def permission_checker(user: DBUser = Depends(get_current_user)):
-        if not check_permission(user, resource, action):
-            raise HTTPException(
-                status_code=403, 
-                detail=f"Permission refusée: {resource}:{action}"
-            )
-        return user
-    return permission_checker
-
-def slugify(text: str) -> str:
-    """Convertit un texte en slug URL-friendly"""
-    import re
-    text = text.lower()
-    text = re.sub(r'[^\w\s-]', '', text)
-    text = re.sub(r'[\s_-]+', '-', text)
-    return text.strip('-')
-
-
-# --- Startup event ---
-
-@app.on_event("startup")
-def startup():
-    init_db()
-    db = next(get_db())
-    seed_demo_data(db)
-    db.close()
-
 
 # --- Health ---
 
 @app.get("/")
 def read_root():
-    return {"message": "Agent SaaS Backend is running 🚀", "version": "0.3.0"}
+    return {
+        "message": "Agent SaaS Backend is running 🚀", 
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT
+    }
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "version": "0.3.0"}
+    return {
+        "status": "ok", 
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT
+    }
 
 
 # ============================================================
@@ -519,7 +511,7 @@ def register(
     session = DBSession(
         user_id=user.id,
         refresh_token=refresh_token,
-        expires_at=datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_at=datetime.utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
     )
     db.add(session)
     db.commit()
@@ -527,7 +519,7 @@ def register(
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_in=JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
             id=user.id,
             email=user.email,
@@ -587,7 +579,7 @@ def login(
     session = DBSession(
         user_id=user.id,
         refresh_token=refresh_token,
-        expires_at=datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_at=datetime.utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
     )
     db.add(session)
     db.commit()
@@ -595,7 +587,7 @@ def login(
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_in=JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
             id=user.id,
             email=user.email,
@@ -663,7 +655,7 @@ def refresh_token(
     new_session = DBSession(
         user_id=user.id,
         refresh_token=new_refresh_token,
-        expires_at=datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_at=datetime.utcnow() + timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
     )
     db.add(new_session)
     db.commit()
@@ -671,7 +663,7 @@ def refresh_token(
     return TokenResponse(
         access_token=access_token,
         refresh_token=new_refresh_token,
-        expires_in=JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
             id=user.id,
             email=user.email,
@@ -1082,7 +1074,7 @@ def get_mcp_tool(tool_id: str, db: Session = Depends(get_db)):
 @app.post("/api/mcp-tools", response_model=MCPToolResponse)
 def create_mcp_tool(tool: MCPToolCreate, db: Session = Depends(get_db)):
     db_tool = DBMCPTool(
-        id=str(uuid.uuid4()),
+        id=str(generate_uuid()),
         **tool.model_dump()
     )
     db.add(db_tool)
@@ -1154,7 +1146,7 @@ def get_prompt(prompt_id: str, db: Session = Depends(get_db)):
 @app.post("/api/prompts", response_model=PromptResponse)
 def create_prompt(prompt: PromptCreate, db: Session = Depends(get_db)):
     db_prompt = DBPrompt(
-        id=str(uuid.uuid4()),
+        id=str(generate_uuid()),
         **prompt.model_dump()
     )
     db.add(db_prompt)
@@ -1260,7 +1252,7 @@ def get_functional_area_details(area_id: str, db: Session = Depends(get_db)):
 def create_functional_area(area: FunctionalAreaCreate, db: Session = Depends(get_db)):
     """Crée un nouveau périmètre fonctionnel"""
     db_area = DBFunctionalArea(
-        id=str(uuid.uuid4()),
+        id=str(generate_uuid()),
         name=area.name,
         description=area.description,
         icon=area.icon,
@@ -1370,7 +1362,7 @@ def create_agent(agent: AgentCreate, db: Session = Depends(get_db)):
     
     # Créer l'agent sans les relations
     agent_data = agent.model_dump(exclude={"mcp_tool_ids", "prompt_ids"})
-    db_agent = DBAgent(id=str(uuid.uuid4()), **agent_data)
+    db_agent = DBAgent(id=str(generate_uuid()), **agent_data)
     
     # Ajouter les relations MCP tools
     if mcp_tool_ids:
@@ -1550,7 +1542,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
     """Chat avec orchestration intelligente et handoff"""
     
     # Récupérer ou créer la conversation
-    conv_id = request.conversation_id or str(uuid.uuid4())
+    conv_id = request.conversation_id or str(generate_uuid())
     
     conversation = db.query(DBConversation).filter(DBConversation.id == conv_id).first()
     if not conversation:
@@ -1918,7 +1910,7 @@ def create_workflow(workflow: WorkflowCreate, db: Session = Depends(get_db)):
     
     # Créer le workflow
     db_workflow = DBWorkflow(
-        id=str(uuid.uuid4()),
+        id=str(generate_uuid()),
         name=workflow.name,
         description=workflow.description,
         agent_id=workflow.agent_id,
@@ -1933,7 +1925,7 @@ def create_workflow(workflow: WorkflowCreate, db: Session = Depends(get_db)):
     # Créer les tâches
     for task_data in workflow.tasks:
         db_task = DBWorkflowTask(
-            id=str(uuid.uuid4()),
+            id=str(generate_uuid()),
             workflow_id=db_workflow.id,
             **task_data.model_dump()
         )
@@ -1943,7 +1935,7 @@ def create_workflow(workflow: WorkflowCreate, db: Session = Depends(get_db)):
     if workflow.trigger_type == "cron" and workflow.trigger_config.get("cron"):
         from datetime import datetime, timedelta
         db_job = DBScheduledJob(
-            id=str(uuid.uuid4()),
+            id=str(generate_uuid()),
             workflow_id=db_workflow.id,
             cron_expression=workflow.trigger_config["cron"],
             timezone=workflow.trigger_config.get("timezone", "Europe/Paris"),
@@ -2003,7 +1995,7 @@ def add_workflow_task(workflow_id: str, task: WorkflowTaskCreate, db: Session = 
         raise HTTPException(status_code=404, detail="Workflow not found")
     
     db_task = DBWorkflowTask(
-        id=str(uuid.uuid4()),
+        id=str(generate_uuid()),
         workflow_id=workflow_id,
         **task.model_dump()
     )
@@ -2064,7 +2056,7 @@ def execute_workflow(workflow_id: str, execution: WorkflowExecutionCreate, db: S
     
     # Créer l'exécution
     db_execution = DBWorkflowExecution(
-        id=str(uuid.uuid4()),
+        id=str(generate_uuid()),
         workflow_id=workflow_id,
         status="pending",
         input_data=execution.input_data,
