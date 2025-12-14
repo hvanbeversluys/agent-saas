@@ -13,6 +13,10 @@
 			"path": "backend"
 		},
 		{
+			"name": "🤖 Worker (Scheduler IA)",
+			"path": "worker"
+		},
+		{
 			"name": "🏗️ Infra",
 			"path": "infra"
 		}

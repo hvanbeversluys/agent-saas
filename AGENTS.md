@@ -5,7 +5,7 @@
     <name>Agent SaaS Platform</name>
     <scope>Fullstack Development, AI Architecture, Business Logic</scope>
     <owner>Founder (You)</owner>
-    <version>0.2.0 (MVP)</version>
+    <version>1.0.0</version>
 </workspace>
 </metadata>
 
@@ -17,6 +17,7 @@ Ce workspace contient plusieurs agents spécialisés. Consultez le fichier `AGEN
 |-----------|---------|-------|
 | 🎨 **Frontend** | [`frontend/AGENTS.md`](frontend/AGENTS.md) | Next.js, React, UI/UX |
 | ⚙️ **Backend** | [`backend/AGENTS.md`](backend/AGENTS.md) | FastAPI, SQLAlchemy, API |
+| 🤖 **Worker** | [`worker/AGENTS.md`](worker/AGENTS.md) | LangGraph, ARQ, AI Pipelines |
 | 🏗️ **Infrastructure** | [`infra/AGENTS.md`](infra/AGENTS.md) | Docker, Terraform, CI/CD |
 
 ---

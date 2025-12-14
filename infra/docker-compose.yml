@@ -1,6 +1,21 @@
-version: '3.8'
-
 services:
+  # === REDIS (Message Queue + State Store) ===
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agent-network
+
+  # === BACKEND API ===
   backend:
     build:
       context: ../backend
@@ -13,9 +28,35 @@ services:
       - ../backend/.env
     environment:
       - RELOAD=true
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - agent-network
 
+  # === WORKER (LangGraph + ARQ) ===
+  worker:
+    build:
+      context: ../worker
+      dockerfile: Dockerfile
+    volumes:
+      - ../worker:/app
+    env_file:
+      - ../backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    networks:
+      - agent-network
+    restart: unless-stopped
+
+  # === FRONTEND ===
   frontend:
     build:
       context: ../frontend
@@ -29,6 +70,9 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
     networks:
       - agent-network
+
+volumes:
+  redis-data:
 
 networks:
   agent-network:

@@ -18,7 +18,9 @@ from security import (
     hash_password, verify_password, generate_api_key, generate_uuid,
     create_access_token, create_refresh_token, decode_token,
     security, require_permission, check_permission, slugify,
-    ROLE_PERMISSIONS, PERMISSIONS
+    ROLE_PERMISSIONS, PERMISSIONS, ROLE_DISPLAY_NAMES, INVITABLE_ROLES,
+    is_admin, is_designer, is_user_only, can_create_content,
+    require_admin, require_designer
 )
 
 # Database
@@ -368,7 +370,7 @@ class TenantUpdate(BaseModel):
 
 class InviteUserRequest(BaseModel):
     email: EmailStr
-    role: str = "member"
+    role: str = "user"  # Par défaut: utilisateur simple
     first_name: Optional[str] = None
     last_name: Optional[str] = None
 
@@ -1048,6 +1050,105 @@ def change_password(
 # 👥 USER MANAGEMENT (Admin)
 # ============================================================
 
+# --- Rôles disponibles ---
+
+class RoleInfo(BaseModel):
+    id: str
+    name: str
+    description: str
+    can_invite: bool  # Si ce rôle peut être attribué par invitation
+
+
+@app.get("/api/roles", response_model=List[RoleInfo])
+def list_roles(
+    user: DBUser = Depends(get_current_user)
+):
+    """
+    Liste les rôles disponibles dans la plateforme.
+    Seuls les admin+ peuvent voir tous les rôles avec leurs permissions.
+    """
+    roles_info = {
+        "owner": {
+            "name": ROLE_DISPLAY_NAMES["owner"],
+            "description": "Propriétaire de l'entreprise avec tous les droits",
+            "can_invite": False  # On ne peut pas inviter un owner
+        },
+        "admin": {
+            "name": ROLE_DISPLAY_NAMES["admin"],
+            "description": "Administrateur système - gestion users, config, tout sauf facturation",
+            "can_invite": True
+        },
+        "designer": {
+            "name": ROLE_DISPLAY_NAMES["designer"],
+            "description": "Concepteur - création et gestion des agents, prompts et workflows",
+            "can_invite": True
+        },
+        "user": {
+            "name": ROLE_DISPLAY_NAMES["user"],
+            "description": "Utilisateur - utilisation des agents et chat uniquement",
+            "can_invite": True
+        }
+    }
+    
+    return [
+        RoleInfo(
+            id=role_id, 
+            name=info["name"], 
+            description=info["description"],
+            can_invite=info["can_invite"]
+        )
+        for role_id, info in roles_info.items()
+    ]
+
+
+@app.get("/api/roles/invitable", response_model=List[RoleInfo])
+def list_invitable_roles(
+    user: DBUser = Depends(require_permission("users", "invite"))
+):
+    """
+    Liste les rôles qu'on peut attribuer lors d'une invitation.
+    Exclut "owner" et les rôles supérieurs au rôle de l'invitant.
+    """
+    # L'admin peut inviter admin, designer, user
+    # Le designer ne peut pas inviter (pas de permission users:invite)
+    # Le user ne peut pas inviter
+    
+    invitable = []
+    user_role = user.role
+    
+    roles_info = {
+        "admin": {
+            "name": ROLE_DISPLAY_NAMES["admin"],
+            "description": "Administrateur système",
+        },
+        "designer": {
+            "name": ROLE_DISPLAY_NAMES["designer"],
+            "description": "Concepteur d'agents et workflows",
+        },
+        "user": {
+            "name": ROLE_DISPLAY_NAMES["user"],
+            "description": "Utilisateur standard",
+        }
+    }
+    
+    # Ordre des rôles pour la hiérarchie
+    role_hierarchy = ["owner", "admin", "designer", "user"]
+    user_level = role_hierarchy.index(user_role) if user_role in role_hierarchy else 999
+    
+    for role_id, info in roles_info.items():
+        role_level = role_hierarchy.index(role_id)
+        # On peut inviter uniquement les rôles de niveau égal ou inférieur
+        if role_level >= user_level:
+            invitable.append(RoleInfo(
+                id=role_id,
+                name=info["name"],
+                description=info["description"],
+                can_invite=True
+            ))
+    
+    return invitable
+
+
 @app.get("/api/users", response_model=List[UserResponse])
 def list_users(
     user: DBUser = Depends(require_permission("users", "read")),
@@ -1094,9 +1195,24 @@ def invite_user(
     if existing:
         raise HTTPException(status_code=400, detail="Cet email est déjà utilisé")
     
-    # Vérifier le rôle (ne peut pas créer un owner)
-    if data.role == UserRole.OWNER.value:
-        raise HTTPException(status_code=403, detail="Impossible de créer un owner")
+    # Valider le rôle
+    valid_roles = ["admin", "designer", "user"]  # Rôles invitables
+    if data.role not in valid_roles:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Rôle invalide. Rôles disponibles: {', '.join(valid_roles)}"
+        )
+    
+    # Vérifier la hiérarchie des rôles
+    role_hierarchy = ["owner", "admin", "designer", "user"]
+    user_level = role_hierarchy.index(user.role) if user.role in role_hierarchy else 999
+    target_level = role_hierarchy.index(data.role)
+    
+    if target_level < user_level:
+        raise HTTPException(
+            status_code=403, 
+            detail="Vous ne pouvez pas inviter un utilisateur avec un rôle supérieur au vôtre"
+        )
     
     # Créer l'utilisateur avec mot de passe temporaire
     temp_password = generate_uuid()[:12]
@@ -1114,6 +1230,11 @@ def invite_user(
     db.refresh(new_user)
     
     # TODO: Envoyer email d'invitation avec lien de reset password
+    logger.info("user_invited", 
+                inviter_id=user.id, 
+                new_user_id=new_user.id, 
+                role=data.role,
+                tenant_id=tenant.id)
     
     return UserResponse(
         id=new_user.id,
@@ -2438,9 +2559,19 @@ def delete_workflow_task(workflow_id: str, task_id: str, db: Session = Depends(g
 # --- Workflow Execution Endpoints ---
 
 @app.post("/api/workflows/{workflow_id}/execute", response_model=WorkflowExecutionResponse)
-def execute_workflow(workflow_id: str, execution: WorkflowExecutionCreate, db: Session = Depends(get_db)):
-    """Lance l'exécution d'un workflow"""
-    workflow = db.query(DBWorkflow).filter(DBWorkflow.id == workflow_id).first()
+def execute_workflow(
+    workflow_id: str, 
+    execution: WorkflowExecutionCreate, 
+    user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lance l'exécution d'un workflow via le worker async."""
+    from services.queue_service import get_queue_service
+    
+    workflow = db.query(DBWorkflow).filter(
+        DBWorkflow.id == workflow_id,
+        DBWorkflow.tenant_id == user.tenant_id
+    ).first()
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
     
@@ -2466,10 +2597,29 @@ def execute_workflow(workflow_id: str, execution: WorkflowExecutionCreate, db: S
     db.commit()
     db.refresh(db_execution)
     
-    # TODO: Lancer l'exécution async (via background task ou queue)
-    # Pour le MVP, on simule une exécution immédiate
-    db_execution.status = "running"
-    db_execution.current_task_order = "1"
+    # Envoyer au worker via Redis
+    queue = get_queue_service()
+    if queue.is_available():
+        success = queue.enqueue_workflow(
+            execution_id=db_execution.id,
+            workflow_id=workflow_id,
+            tenant_id=user.tenant_id,
+            input_data=execution.input_data,
+            priority=execution.input_data.get("_priority", "normal")
+        )
+        if success:
+            db_execution.status = "queued"
+            logger.info("workflow_queued", execution_id=db_execution.id, workflow_id=workflow_id)
+        else:
+            db_execution.status = "failed"
+            db_execution.error = "Failed to enqueue workflow"
+            logger.error("workflow_enqueue_failed", execution_id=db_execution.id)
+    else:
+        # Fallback: marquer comme running pour traitement synchrone (dev mode)
+        db_execution.status = "running"
+        db_execution.current_task_order = "1"
+        logger.warning("redis_unavailable_sync_mode", execution_id=db_execution.id)
+    
     db.commit()
     db.refresh(db_execution)
     
@@ -2531,6 +2681,118 @@ def approve_execution(execution_id: str, approved: bool = True, db: Session = De
     
     db.commit()
     return {"message": "Approval processed", "status": execution.status}
+
+
+# --- Queue & Worker Status ---
+
+class QueueStatusResponse(BaseModel):
+    available: bool
+    queue_length: int = 0
+    worker_active: bool = False
+
+
+@app.get("/api/queue/status", response_model=QueueStatusResponse)
+def get_queue_status(user: DBUser = Depends(require_permission("workflows", "read"))):
+    """Vérifie le statut de la queue Redis et du worker."""
+    from services.queue_service import get_queue_service
+    
+    queue = get_queue_service()
+    available = queue.is_available()
+    
+    queue_length = 0
+    worker_active = False
+    
+    if available:
+        try:
+            # Compter les jobs en attente
+            queue_length = queue.client.llen("arq:queue:default")
+            # Vérifier si le worker est actif (heartbeat)
+            worker_active = queue.client.exists("arq:worker:health") > 0
+        except Exception:
+            pass
+    
+    return QueueStatusResponse(
+        available=available,
+        queue_length=queue_length,
+        worker_active=worker_active
+    )
+
+
+class AgentTaskRequest(BaseModel):
+    agent_id: str
+    task_type: str = "chat"  # chat, tool_call, analyze
+    payload: Dict[str, Any]
+    async_mode: bool = True  # Si False, exécution synchrone
+
+
+class AgentTaskResponse(BaseModel):
+    job_id: Optional[str] = None
+    status: str
+    result: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/agents/{agent_id}/tasks", response_model=AgentTaskResponse)
+def create_agent_task(
+    agent_id: str,
+    task: AgentTaskRequest,
+    user: DBUser = Depends(require_permission("agents", "execute")),
+    db: Session = Depends(get_db)
+):
+    """
+    Crée une tâche async pour un agent.
+    Utilisé pour les opérations longues (analyse de document, tool calls multiples).
+    """
+    from services.queue_service import get_queue_service
+    
+    # Vérifier que l'agent existe
+    agent = db.query(DBAgent).filter(
+        DBAgent.id == agent_id,
+        DBAgent.tenant_id == user.tenant_id
+    ).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    queue = get_queue_service()
+    
+    if task.async_mode and queue.is_available():
+        job_id = queue.enqueue_agent_task(
+            task_type=task.task_type,
+            agent_id=agent_id,
+            tenant_id=user.tenant_id,
+            payload=task.payload
+        )
+        if job_id:
+            return AgentTaskResponse(job_id=job_id, status="queued")
+        else:
+            raise HTTPException(status_code=503, detail="Failed to enqueue task")
+    else:
+        # Mode synchrone (fallback ou demandé)
+        # TODO: Implémenter exécution synchrone
+        return AgentTaskResponse(
+            status="sync_not_implemented",
+            result={"message": "Synchronous execution not yet implemented"}
+        )
+
+
+@app.get("/api/tasks/{job_id}/status", response_model=AgentTaskResponse)
+def get_task_status(
+    job_id: str,
+    user: DBUser = Depends(get_current_user)
+):
+    """Récupère le statut d'une tâche async."""
+    from services.queue_service import get_queue_service
+    
+    queue = get_queue_service()
+    status = queue.get_job_status(job_id)
+    
+    if status:
+        return AgentTaskResponse(
+            job_id=job_id,
+            status=status.get("status", "unknown"),
+            result=status.get("result")
+        )
+    else:
+        return AgentTaskResponse(job_id=job_id, status="not_found")
 
 
 # ============================================================

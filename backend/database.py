@@ -109,11 +109,18 @@ class DBTenant(Base):
 # ============================================================
 
 class UserRole(str, Enum):
-    OWNER = "owner"          # Propriétaire - tous les droits
-    ADMIN = "admin"          # Admin - gestion users + config
-    MANAGER = "manager"      # Manager - gestion agents/workflows
-    MEMBER = "member"        # Membre - utilisation seule
-    VIEWER = "viewer"        # Lecture seule
+    """
+    Rôles utilisateur simplifiés pour Agent SaaS.
+    
+    - OWNER: Fondateur/propriétaire du tenant - tous les droits
+    - ADMIN: Administrateur - gestion users, config, tout sauf billing
+    - DESIGNER: Concepteur - création/gestion agents, prompts, workflows
+    - USER: Utilisateur - utilisation des agents uniquement
+    """
+    OWNER = "owner"          # Propriétaire - tous les droits (1 par tenant)
+    ADMIN = "admin"          # Admin - gestion système + contenu
+    DESIGNER = "designer"    # Concepteur - création agents/prompts/workflows
+    USER = "user"            # Utilisateur - utilisation seule
 
 class DBUser(Base):
     """Utilisateur d'une entreprise"""
@@ -134,7 +141,7 @@ class DBUser(Base):
     phone = Column(String(50))
     
     # Rôle & Permissions
-    role = Column(String(20), default=UserRole.MEMBER.value)
+    role = Column(String(20), default=UserRole.USER.value)
     permissions = Column(JSON, default=list)  # Permissions spécifiques additionnelles
     
     # Préférences
@@ -454,26 +461,24 @@ PERMISSIONS = {
     "api_keys": ["create", "read", "delete"],
 }
 
-# Permissions par rôle
+# Permissions par rôle (synchronisé avec security.py)
+# NOTE: La source de vérité des permissions est dans security.py
+# Ces définitions sont conservées ici pour référence mais ne sont pas utilisées directement
 ROLE_PERMISSIONS = {
     UserRole.OWNER.value: "*",  # Tous les droits
     UserRole.ADMIN.value: [
         "agents:*", "prompts:*", "workflows:*", "mcp_tools:*",
-        "users:create", "users:read", "users:update", "users:invite",
-        "settings:*", "api_keys:*", "billing:read"
+        "users:*", "tenant:*", "llm:*"
     ],
-    UserRole.MANAGER.value: [
-        "agents:*", "prompts:*", "workflows:*", "mcp_tools:read", "mcp_tools:configure",
-        "users:read", "settings:read"
+    UserRole.DESIGNER.value: [
+        "agents:*", "prompts:*", "workflows:*", 
+        "mcp_tools:read", "mcp_tools:execute"
     ],
-    UserRole.MEMBER.value: [
+    UserRole.USER.value: [
         "agents:read", "agents:execute",
         "prompts:read",
         "workflows:read", "workflows:execute",
         "mcp_tools:read"
-    ],
-    UserRole.VIEWER.value: [
-        "agents:read", "prompts:read", "workflows:read", "mcp_tools:read"
     ],
 }
 

@@ -99,39 +99,118 @@ def decode_token(token: str) -> dict:
 
 
 # === RBAC Permissions ===
+# Resources et actions disponibles dans la plateforme
 PERMISSIONS = {
+    # Core resources
     "agents": ["create", "read", "update", "delete", "execute"],
     "prompts": ["create", "read", "update", "delete"],
     "workflows": ["create", "read", "update", "delete", "execute"],
-    "mcp_tools": ["create", "read", "update", "delete", "configure"],
+    "mcp_tools": ["create", "read", "update", "delete", "configure", "connect"],
+    # Administration
     "users": ["create", "read", "update", "delete", "invite"],
     "billing": ["read", "manage"],
     "settings": ["read", "update"],
     "api_keys": ["create", "read", "delete"],
+    "tenant": ["read", "update", "manage"],
+    # Chat/Usage
+    "chat": ["use"],
 }
 
+# === Rôles Utilisateurs ===
+# 3 rôles principaux + owner (créateur du tenant)
+#
+# | Rôle        | Description                                          |
+# |-------------|------------------------------------------------------|
+# | owner       | Créateur du compte, tous les droits                  |
+# | admin       | Gère l'entreprise, MCPs, users, peut tout faire      |
+# | designer    | Conçoit agents, prompts, workflows                   |
+# | user        | Utilise les agents (chat) sans créer                 |
+
 ROLE_PERMISSIONS = {
-    "owner": "*",  # Tous les droits
+    # Owner = créateur du compte entreprise (tous les droits)
+    "owner": "*",
+    
+    # Admin = gestionnaire de l'entreprise
+    # - Configure les MCPs et connexions externes
+    # - Gère les utilisateurs
+    # - Peut aussi concevoir et utiliser (tous les droits sauf billing:manage)
     "admin": [
-        "agents:*", "prompts:*", "workflows:*", "mcp_tools:*",
-        "users:create", "users:read", "users:update", "users:invite",
-        "settings:*", "api_keys:*", "billing:read"
+        # Administration système
+        "mcp_tools:*",
+        "users:*",
+        "settings:*",
+        "api_keys:*",
+        "tenant:*",
+        "billing:read",
+        # Conception (comme designer)
+        "agents:*",
+        "prompts:*",
+        "workflows:*",
+        # Usage (comme user)
+        "chat:use",
     ],
+    
+    # Designer/Concepteur = créateur d'agents et workflows
+    # - Crée et configure les agents, prompts, workflows
+    # - Peut utiliser les MCPs configurés par l'admin
+    # - Ne peut pas gérer les utilisateurs ni les connexions MCP
+    "designer": [
+        # Conception
+        "agents:*",
+        "prompts:*",
+        "workflows:*",
+        # Lecture MCPs (configurés par admin)
+        "mcp_tools:read",
+        # Usage
+        "chat:use",
+        # Lecture settings
+        "settings:read",
+    ],
+    
+    # User = utilisateur final
+    # - Utilise les agents via le chat
+    # - Exécute les workflows autorisés
+    # - Lecture seule sur tout le reste
+    "user": [
+        # Chat uniquement
+        "chat:use",
+        # Exécution agents/workflows
+        "agents:read",
+        "agents:execute",
+        "workflows:read",
+        "workflows:execute",
+        # Lecture
+        "prompts:read",
+        "mcp_tools:read",
+    ],
+    
+    # Legacy roles (rétro-compatibilité)
     "manager": [
         "agents:*", "prompts:*", "workflows:*", 
         "mcp_tools:read", "mcp_tools:configure",
-        "users:read", "settings:read"
+        "users:read", "settings:read", "chat:use",
     ],
     "member": [
         "agents:read", "agents:execute",
         "prompts:read",
         "workflows:read", "workflows:execute",
-        "mcp_tools:read"
+        "mcp_tools:read", "chat:use",
     ],
     "viewer": [
-        "agents:read", "prompts:read", "workflows:read", "mcp_tools:read"
+        "agents:read", "prompts:read", "workflows:read", "mcp_tools:read",
     ],
 }
+
+# Mapping pour l'affichage UI
+ROLE_DISPLAY_NAMES = {
+    "owner": "Propriétaire",
+    "admin": "Administrateur",
+    "designer": "Concepteur",
+    "user": "Utilisateur",
+}
+
+# Rôles disponibles lors de l'invitation d'un utilisateur
+INVITABLE_ROLES = ["admin", "designer", "user"]
 
 
 def check_permission(user_role: str, user_permissions: list, resource: str, action: str) -> bool:
@@ -253,3 +332,116 @@ def slugify(text: str) -> str:
     text = re.sub(r'[^\w\s-]', '', text)
     text = re.sub(r'[\s_-]+', '-', text)
     return text.strip('-')
+
+
+# === Role Helpers ===
+def is_admin_or_owner(user_role: str) -> bool:
+    """Vérifie si l'utilisateur est admin ou owner."""
+    return user_role in ["owner", "admin"]
+
+
+def is_designer_or_above(user_role: str) -> bool:
+    """Vérifie si l'utilisateur peut concevoir (designer, admin, owner)."""
+    return user_role in ["owner", "admin", "designer"]
+
+
+def can_manage_users(user_role: str) -> bool:
+    """Vérifie si l'utilisateur peut gérer les autres utilisateurs."""
+    return user_role in ["owner", "admin"]
+
+
+def can_configure_mcp(user_role: str) -> bool:
+    """Vérifie si l'utilisateur peut configurer les MCPs."""
+    return user_role in ["owner", "admin"]
+
+
+def can_use_chat(user_role: str) -> bool:
+    """Vérifie si l'utilisateur peut utiliser le chat."""
+    return user_role in ["owner", "admin", "designer", "user"]
+
+
+# ============================================================
+# 🔧 ROLE HELPERS - Fonctions utilitaires pour les rôles
+# ============================================================
+
+def is_admin(user_role: str) -> bool:
+    """Vérifie si l'utilisateur est admin ou owner."""
+    return user_role in ["owner", "admin"]
+
+
+def is_designer(user_role: str) -> bool:
+    """Vérifie si l'utilisateur est concepteur ou supérieur."""
+    return user_role in ["owner", "admin", "designer"]
+
+
+def is_user_only(user_role: str) -> bool:
+    """Vérifie si l'utilisateur est un simple utilisateur."""
+    return user_role == "user"
+
+
+def can_create_content(user_role: str) -> bool:
+    """
+    Vérifie si l'utilisateur peut créer du contenu (agents, prompts, workflows).
+    Seuls les designers+ peuvent créer.
+    """
+    return user_role in ["owner", "admin", "designer"]
+
+
+def require_role(*allowed_roles: str):
+    """
+    Dependency Factory pour vérifier le rôle de l'utilisateur.
+    
+    Usage:
+        @app.get("/admin/users")
+        def get_users(user = Depends(require_role("owner", "admin"))):
+            ...
+    """
+    from database import DBUser, get_db
+    
+    def role_checker(
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: Session = Depends(get_db)
+    ) -> "DBUser":
+        if not credentials:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Non authentifié",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        payload = decode_token(credentials.credentials)
+        
+        if payload.get("type") != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Type de token invalide"
+            )
+        
+        user = db.query(DBUser).filter(DBUser.id == payload["sub"]).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Utilisateur non trouvé"
+            )
+        
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Compte désactivé"
+            )
+        
+        if user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Accès réservé aux rôles: {', '.join(ROLE_DISPLAY_NAMES.get(r, r) for r in allowed_roles)}"
+            )
+        
+        return user
+    
+    return role_checker
+
+
+# Shortcuts pour les cas courants
+require_admin = require_role("owner", "admin")
+require_designer = require_role("owner", "admin", "designer")
+require_any_user = require_role("owner", "admin", "designer", "user")
