@@ -1790,10 +1790,53 @@ def detect_best_agent(message: str, agents: list, current_agent_id: str = None) 
     return None, None
 
 
+def _detect_task_type(message: str):
+    """Détecte le type de tâche à partir du message pour optimiser le routing LLM."""
+    from llm import TaskType
+    
+    message_lower = message.lower()
+    
+    # Patterns pour chaque type
+    code_patterns = ["code", "python", "javascript", "fonction", "bug", "erreur", "debug", "api"]
+    analyze_patterns = ["analyse", "évalue", "compare", "examine", "diagnostic", "audit"]
+    summarize_patterns = ["résume", "synthèse", "résumé", "condense", "simplifie"]
+    email_patterns = ["email", "mail", "message", "courrier", "envoie", "relance"]
+    creative_patterns = ["écris", "rédige", "crée", "invente", "génère", "article", "blog", "contenu"]
+    
+    # Détection par priorité
+    if any(p in message_lower for p in code_patterns):
+        return TaskType.CODE
+    if any(p in message_lower for p in analyze_patterns):
+        return TaskType.ANALYZE
+    if any(p in message_lower for p in summarize_patterns):
+        return TaskType.SUMMARIZE
+    if any(p in message_lower for p in email_patterns):
+        return TaskType.EMAIL
+    if any(p in message_lower for p in creative_patterns):
+        return TaskType.CREATIVE
+    
+    # Messages courts = QUICK
+    if len(message) < 50:
+        return TaskType.QUICK
+    
+    return TaskType.CHAT
+
+
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, db: Session = Depends(get_db)):
-    """Chat avec orchestration intelligente, handoff et LLM réel."""
-    from services import agent_service
+async def chat(
+    request: ChatRequest, 
+    db: Session = Depends(get_db),
+    current_user: Optional[DBUser] = Depends(get_optional_user)
+):
+    """Chat avec orchestration intelligente, handoff et LLM réel.
+    
+    Utilise TenantLLMService pour:
+    - Respecter les limites de tokens du plan
+    - Utiliser les clés BYOK si configurées
+    - Logger l'usage pour la facturation
+    """
+    from services.llm_service import TenantLLMService
+    from llm import TaskType
     
     # Récupérer ou créer la conversation
     conv_id = request.conversation_id or str(generate_uuid())
@@ -1841,10 +1884,18 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                 # Mettre à jour la conversation avec le nouvel agent
                 conversation.agent_id = target_agent.id
     
-    # Générer la réponse avec LLM si disponible
-    if agent_service.is_available and response_agent:
+    # Générer la réponse avec LLM via TenantLLMService
+    # Détermine le tenant_id (utilisateur connecté ou tenant par défaut)
+    tenant_id = current_user.tenant_id if current_user else None
+    user_id = current_user.id if current_user else None
+    
+    # Si tenant_id disponible, utiliser le service tenant-aware
+    if tenant_id and response_agent:
+        llm_service = TenantLLMService(db)
+        
         # Préparer la config de l'agent
         agent_config = {
+            "id": response_agent.id,
             "name": response_agent.name,
             "icon": response_agent.icon,
             "description": response_agent.description,
@@ -1856,37 +1907,88 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         history = messages[-10:-1] if len(messages) > 1 else []
         
         # Détecter le type de tâche
-        task_type = agent_service.detect_task_type(request.message)
+        task_type = _detect_task_type(request.message)
         
-        # Appeler le LLM
+        # Appeler le LLM via TenantLLMService (respecte quotas + BYOK)
         try:
-            llm_response = await agent_service.chat(
+            llm_response = await llm_service.chat(
+                tenant_id=tenant_id,
                 message=request.message,
+                user_id=user_id,
                 agent_config=agent_config,
                 conversation_history=history,
                 task_type=task_type,
             )
-            response_content = llm_response["content"]
             
-            # Log usage for billing
-            logger.info(
-                "LLM chat completed",
-                agent_id=response_agent.id if response_agent else None,
-                model=llm_response.get("model"),
-                tokens=llm_response.get("usage", {}).get("total_tokens", 0),
-            )
+            # Vérifier si erreur (limite atteinte, etc.)
+            if "error" in llm_response:
+                logger.warning(
+                    "LLM limit reached or error",
+                    tenant_id=tenant_id,
+                    error=llm_response["error"],
+                )
+                # Retourner le message d'erreur à l'utilisateur
+                response_content = f"⚠️ {llm_response['message']}"
+            else:
+                response_content = llm_response["content"]
+                
+                # Log pour monitoring
+                logger.info(
+                    "Tenant LLM chat completed",
+                    tenant_id=tenant_id,
+                    agent_id=response_agent.id,
+                    model=llm_response.get("model"),
+                    tokens=llm_response.get("usage", {}).get("total_tokens", 0),
+                    cost_usd=llm_response.get("cost_usd", 0),
+                    mode=llm_response.get("mode"),
+                )
         except Exception as e:
-            logger.error("LLM chat failed, using fallback", error=str(e))
+            logger.error("Tenant LLM chat failed, using fallback", error=str(e), tenant_id=tenant_id)
+            response_content = generate_orchestrated_response(
+                request.message, 
+                response_agent, 
+                handoff_info
+            )
+    elif response_agent:
+        # Fallback pour utilisateurs non connectés: utiliser agent_service global
+        from services import agent_service
+        
+        if agent_service.is_available:
+            agent_config = {
+                "name": response_agent.name,
+                "icon": response_agent.icon,
+                "description": response_agent.description,
+                "system_prompt": response_agent.system_prompt or "",
+            }
+            history = messages[-10:-1] if len(messages) > 1 else []
+            task_type = _detect_task_type(request.message)
+            
+            try:
+                llm_response = await agent_service.chat(
+                    message=request.message,
+                    agent_config=agent_config,
+                    conversation_history=history,
+                    task_type=task_type,
+                )
+                response_content = llm_response["content"]
+            except Exception as e:
+                logger.error("LLM chat failed, using fallback", error=str(e))
+                response_content = generate_orchestrated_response(
+                    request.message, 
+                    response_agent, 
+                    handoff_info
+                )
+        else:
             response_content = generate_orchestrated_response(
                 request.message, 
                 response_agent, 
                 handoff_info
             )
     else:
-        # Fallback: réponse statique
+        # Pas d'agent, réponse générique
         response_content = generate_orchestrated_response(
             request.message, 
-            response_agent, 
+            None, 
             handoff_info
         )
     
