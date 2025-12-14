@@ -3,6 +3,7 @@ Workflow Tasks - Async workflow execution tasks.
 """
 from typing import Dict, Any, Optional
 from datetime import datetime
+import json
 import structlog
 from redis.asyncio import Redis
 
@@ -10,6 +11,66 @@ from config import settings
 
 logger = structlog.get_logger()
 
+
+# ============================================================
+# 📡 Event Publishing (SSE via Redis Pub/Sub)
+# ============================================================
+
+async def publish_workflow_event(
+    redis: Redis,
+    tenant_id: str,
+    event_type: str,
+    data: Dict[str, Any]
+):
+    """
+    Publie un événement workflow sur le channel Redis du tenant.
+    Ces événements sont consommés par le backend SSE endpoint.
+    """
+    event = {
+        "type": f"workflow.{event_type}",
+        "tenant_id": tenant_id,
+        "data": data,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    
+    channel = f"events:{tenant_id}"
+    
+    try:
+        await redis.publish(channel, json.dumps(event))
+        logger.debug("event_published", event_type=f"workflow.{event_type}", channel=channel)
+    except Exception as e:
+        logger.error("event_publish_failed", error=str(e))
+
+
+async def publish_step_event(
+    redis: Redis,
+    tenant_id: str,
+    workflow_id: str,
+    execution_id: str,
+    step_index: int,
+    step_name: str,
+    status: str,
+    output: Any = None
+):
+    """Publie un événement de progression de step."""
+    await publish_workflow_event(
+        redis=redis,
+        tenant_id=tenant_id,
+        event_type="step_completed",
+        data={
+            "workflow_id": workflow_id,
+            "execution_id": execution_id,
+            "step_index": step_index,
+            "step_name": step_name,
+            "status": status,
+            "output": output,
+        }
+    )
+
+
+# ============================================================
+# Workflow Execution
+# ============================================================
 
 async def run_workflow(
     workflow_id: str,
@@ -54,6 +115,18 @@ async def run_workflow(
     })
     await redis.expire(state_key, 86400)  # 24h TTL
     
+    # 📡 Publish workflow started event
+    await publish_workflow_event(
+        redis=redis,
+        tenant_id=tenant_id,
+        event_type="started",
+        data={
+            "workflow_id": workflow_id,
+            "execution_id": execution_id,
+            "message": "Workflow started",
+        }
+    )
+    
     try:
         # Load workflow definition
         workflow = await load_workflow_from_backend(workflow_id, tenant_id)
@@ -88,6 +161,20 @@ async def run_workflow(
             result=result,
         )
         
+        # 📡 Publish workflow completed event
+        await publish_workflow_event(
+            redis=redis,
+            tenant_id=tenant_id,
+            event_type="completed",
+            data={
+                "workflow_id": workflow_id,
+                "execution_id": execution_id,
+                "message": "Workflow completed successfully",
+                "steps_completed": len(result.get("step_results", [])),
+                "output_data": result.get("output_data", {}),
+            }
+        )
+        
         logger.info(
             "Workflow completed",
             workflow_id=workflow_id,
@@ -116,6 +203,19 @@ async def run_workflow(
             "error": str(e),
             "failed_at": datetime.utcnow().isoformat(),
         })
+        
+        # 📡 Publish workflow failed event
+        await publish_workflow_event(
+            redis=redis,
+            tenant_id=tenant_id,
+            event_type="failed",
+            data={
+                "workflow_id": workflow_id,
+                "execution_id": execution_id,
+                "message": "Workflow failed",
+                "error": str(e),
+            }
+        )
         
         # Notify backend of failure
         await notify_workflow_failed(

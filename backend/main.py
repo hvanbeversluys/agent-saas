@@ -4,7 +4,7 @@ Multi-tenant SaaS platform for AI employees management.
 """
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
@@ -671,6 +671,119 @@ def llm_status():
     """Get LLM providers status and available models."""
     from services import agent_service
     return agent_service.get_status()
+
+
+# ============================================================
+# 📡 SERVER-SENT EVENTS (Real-time)
+# ============================================================
+
+@app.get("/api/events/stream")
+async def event_stream(
+    token: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    SSE endpoint pour les événements temps réel.
+    
+    Note: EventSource ne supporte pas les headers custom, donc le token
+    est passé en query parameter. Pour une sécurité accrue en prod,
+    utiliser un token SSE dédié avec TTL court.
+    
+    Le client se connecte et reçoit les événements du tenant en temps réel:
+    - workflow.started, workflow.completed, workflow.failed
+    - agent.response, agent.thinking
+    - notification.info, notification.success, notification.error
+    
+    Usage JS:
+        const eventSource = new EventSource('/api/events/stream?token=<jwt>');
+        eventSource.addEventListener('workflow.completed', (e) => {
+            console.log(JSON.parse(e.data));
+        });
+    """
+    from services.event_service import get_event_service
+    
+    # Authentification via query param (nécessaire pour SSE)
+    if not token:
+        raise HTTPException(status_code=401, detail="Token required")
+    
+    try:
+        payload = decode_token(token)
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        
+        user = db.query(DBUser).filter(DBUser.id == payload["sub"]).first()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=401, detail="User not found or inactive")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    event_service = get_event_service()
+    
+    async def generate():
+        try:
+            async for event in event_service.subscribe(
+                tenant_id=user.tenant_id,
+                user_id=user.id
+            ):
+                yield event
+        except Exception as e:
+            logger.error("sse_stream_error", error=str(e))
+            yield f"event: error\ndata: {{'error': '{str(e)}'}}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
+
+
+@app.post("/api/events/test")
+async def test_event(
+    event_type: str = "notification.info",
+    message: str = "Test notification",
+    user: DBUser = Depends(get_current_user)
+):
+    """
+    [Dev] Envoie un événement de test.
+    Utile pour tester les notifications SSE.
+    """
+    from services.event_service import get_event_service
+    
+    if not settings.is_development:
+        raise HTTPException(status_code=403, detail="Only available in development")
+    
+    event_service = get_event_service()
+    
+    await event_service.publish(
+        event_type=event_type,
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        data={"message": message}
+    )
+    
+    return {"message": f"Event '{event_type}' sent", "tenant_id": user.tenant_id}
+
+
+@app.get("/api/events/status")
+def event_status(
+    user: DBUser = Depends(get_current_user)
+):
+    """Statut des connexions SSE."""
+    from services.event_service import get_event_service
+    
+    event_service = get_event_service()
+    
+    return {
+        "tenant_connections": event_service.get_connection_count(user.tenant_id),
+        "total_connections": event_service.get_connection_count(),
+        "redis_available": settings.REDIS_URL is not None,
+    }
 
 
 # ============================================================
