@@ -1,0 +1,27 @@
+# =============================================================================
+# Terraform Variables - Example
+# =============================================================================
+# Copiez ce fichier vers terraform.tfvars et remplissez vos valeurs
+# NE COMMITEZ JAMAIS terraform.tfvars avec vos secrets !
+# =============================================================================
+
+# REQUIRED: Votre username GitHub
+github_owner = "votre-username-github"
+
+# REQUIRED: GitHub Personal Access Token
+# Créez-en un sur: https://github.com/settings/tokens
+# Scopes requis: repo, workflow, admin:org (si org)
+github_token = "ghp_xxxxxxxxxxxxxxxxxxxx"
+
+# Nom du repository (default: agent-saas)
+repository_name = "agent-saas"
+
+# Description
+repository_description = "🤖 Usine à Employés Numériques - Plateforme SaaS d'automatisation IA"
+
+# Visibilité (public ou private)
+repository_visibility = "private"
+
+# OPTIONAL: Docker Hub credentials pour push des images
+# docker_username = "votre-docker-username"
+# docker_password = "votre-docker-token"

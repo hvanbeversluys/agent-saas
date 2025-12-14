@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"name": "🚀 Platform Root",
+			"path": "."
+		},
+		{
+			"name": "🎨 Frontend",
+			"path": "frontend"
+		},
+		{
+			"name": "⚙️ Backend",
+			"path": "backend"
+		},
+		{
+			"name": "🏗️ Infra",
+			"path": "infra"
+		}
+	],
+	"settings": {
+		"workbench.colorCustomizations": {
+			"activityBar.background": "#1e293b",
+			"titleBar.activeBackground": "#0f172a",
+			"titleBar.activeForeground": "#e2e8f0"
+		}
+	}
+}
