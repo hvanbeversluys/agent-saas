@@ -5,6 +5,8 @@ import Chat from "./components/Chat";
 import EmployeeWizard from "./components/EmployeeWizard";
 import WorkflowBuilder from "./components/WorkflowBuilder";
 import UserDashboard from "./components/UserDashboard";
+import FunctionalAreaSelector from "./components/FunctionalAreaSelector";
+import FunctionalAreaView from "./components/FunctionalAreaView";
 
 interface Agent {
   id: string;
@@ -17,6 +19,7 @@ interface Agent {
   mcp_tools: { id: string; name: string; icon: string }[];
   prompts: { id: string; name: string }[];
   is_active: boolean;
+  functional_area_id?: string;
 }
 
 interface MCPTool {
@@ -28,6 +31,7 @@ interface MCPTool {
   scope: "enterprise" | "business";
   status: string;
   config_required: string[];
+  functional_area_id?: string;
 }
 
 interface Prompt {
@@ -38,6 +42,7 @@ interface Prompt {
   scope: "enterprise" | "business";
   template: string;
   variables: string[];
+  functional_area_id?: string;
 }
 
 interface Workflow {
@@ -57,6 +62,7 @@ interface Workflow {
   }[];
   is_active: boolean;
   created_at: string;
+  functional_area_id?: string;
 }
 
 interface WorkflowExecution {
@@ -69,17 +75,20 @@ interface WorkflowExecution {
 
 type UserMode = "user" | "builder";
 type BuilderTab = "employees" | "workflows";
+type BuilderView = "list" | "by-area";
 type UserTab = "dashboard" | "chat" | "my-workflows";
 
 export default function Home() {
   const [mode, setMode] = useState<UserMode>("user");
   const [builderTab, setBuilderTab] = useState<BuilderTab>("employees");
+  const [builderView, setBuilderView] = useState<BuilderView>("by-area");
   const [userTab, setUserTab] = useState<UserTab>("dashboard");
   const [agents, setAgents] = useState<Agent[]>([]);
   const [mcpTools, setMcpTools] = useState<MCPTool[]>([]);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
+  const [selectedAreaId, setSelectedAreaId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showWizard, setShowWizard] = useState(false);
@@ -478,34 +487,72 @@ export default function Home() {
           /* ========== MODE CONSTRUCTEUR ========== */
           <div className="space-y-6">
             {/* Builder Tabs */}
-            <div className="flex items-center gap-4 border-b border-slate-700 pb-4">
-              <button
-                onClick={() => setBuilderTab("employees")}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
-                  builderTab === "employees"
-                    ? "bg-purple-600 text-white"
-                    : "text-slate-400 hover:text-white hover:bg-slate-800"
-                }`}
-              >
-                👥 Employés
-                <span className="text-xs bg-slate-700 px-2 py-0.5 rounded-full">
-                  {agents.length}
-                </span>
-              </button>
-              <button
-                onClick={() => setBuilderTab("workflows")}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
-                  builderTab === "workflows"
-                    ? "bg-purple-600 text-white"
-                    : "text-slate-400 hover:text-white hover:bg-slate-800"
-                }`}
-              >
-                ⚡ Workflows
-                <span className="text-xs bg-slate-700 px-2 py-0.5 rounded-full">
-                  {workflows.length}
-                </span>
-              </button>
+            <div className="flex items-center justify-between border-b border-slate-700 pb-4">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => setBuilderTab("employees")}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+                    builderTab === "employees"
+                      ? "bg-purple-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  👥 Employés
+                  <span className="text-xs bg-slate-700 px-2 py-0.5 rounded-full">
+                    {agents.length}
+                  </span>
+                </button>
+                <button
+                  onClick={() => setBuilderTab("workflows")}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+                    builderTab === "workflows"
+                      ? "bg-purple-600 text-white"
+                      : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
+                >
+                  ⚡ Workflows
+                  <span className="text-xs bg-slate-700 px-2 py-0.5 rounded-full">
+                    {workflows.length}
+                  </span>
+                </button>
+              </div>
+
+              {/* View Toggle */}
+              <div className="flex items-center gap-2 bg-slate-800 rounded-lg p-1">
+                <button
+                  onClick={() => setBuilderView("by-area")}
+                  className={`px-3 py-1.5 rounded text-sm font-medium transition-all ${
+                    builderView === "by-area"
+                      ? "bg-slate-700 text-white"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  📁 Par périmètre
+                </button>
+                <button
+                  onClick={() => setBuilderView("list")}
+                  className={`px-3 py-1.5 rounded text-sm font-medium transition-all ${
+                    builderView === "list"
+                      ? "bg-slate-700 text-white"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  📋 Liste
+                </button>
+              </div>
             </div>
+
+            {/* Filtre par périmètre (mode liste uniquement) */}
+            {builderView === "list" && (
+              <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4">
+                <div className="text-sm text-slate-400 mb-3">Filtrer par périmètre fonctionnel :</div>
+                <FunctionalAreaSelector
+                  selectedAreaId={selectedAreaId}
+                  onSelect={setSelectedAreaId}
+                  compact={true}
+                />
+              </div>
+            )}
 
             {builderTab === "employees" ? (
               /* ========== TAB EMPLOYEES ========== */
@@ -515,7 +562,9 @@ export default function Home() {
                   <div>
                     <h2 className="text-2xl font-bold text-white">👥 Vos Employés Virtuels</h2>
                     <p className="text-slate-400 mt-1">
-                      Créez et configurez vos assistants IA personnalisés
+                      {builderView === "by-area" 
+                        ? "Organisés par périmètre fonctionnel" 
+                        : "Créez et configurez vos assistants IA personnalisés"}
                     </p>
                   </div>
                   <button
@@ -527,87 +576,112 @@ export default function Home() {
                   </button>
                 </div>
 
-                {/* Employees Grid */}
-                {agents.length > 0 ? (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {agents.map((agent) => (
-                      <div
-                        key={agent.id}
-                        className="bg-slate-800/50 border border-slate-700 rounded-2xl p-6 hover:border-slate-600 transition-all group"
-                      >
-                        <div className="flex items-start justify-between mb-4">
-                          <span className="text-4xl">{agent.icon}</span>
-                          <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <button className="p-2 bg-slate-700 hover:bg-blue-600 rounded-lg text-sm">
-                              ✏️
-                            </button>
-                            <button className="p-2 bg-slate-700 hover:bg-red-600 rounded-lg text-sm">
-                              🗑️
-                            </button>
-                          </div>
-                        </div>
-                        <h3 className="text-lg font-semibold text-white mb-2">{agent.name}</h3>
-                        <p className="text-sm text-slate-400 mb-4 line-clamp-2">
-                          {agent.description}
-                        </p>
-
-                        {/* Tools & Prompts */}
-                        <div className="flex flex-wrap gap-2 mb-4">
-                          {agent.mcp_tools.slice(0, 3).map((tool) => (
-                            <span
-                              key={tool.id}
-                              className="text-xs bg-slate-700 text-slate-300 px-2 py-1 rounded-full"
-                            >
-                              {tool.icon} {tool.name}
-                            </span>
-                          ))}
-                          {agent.mcp_tools.length > 3 && (
-                            <span className="text-xs text-slate-500">
-                              +{agent.mcp_tools.length - 3}
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Status */}
-                        <div className="flex items-center justify-between pt-4 border-t border-slate-700">
-                          <span
-                            className={`text-xs px-2 py-1 rounded-full ${
-                              agent.is_active
-                                ? "bg-green-500/20 text-green-400"
-                                : "bg-slate-600/50 text-slate-400"
-                            }`}
+                {/* Vue par périmètre */}
+                {builderView === "by-area" ? (
+                  <FunctionalAreaView
+                    agents={agents}
+                    prompts={prompts}
+                    workflows={workflows}
+                    onSelectAgent={(agentId) => {
+                      const agent = agents.find(a => a.id === agentId);
+                      if (agent) setSelectedAgent(agent);
+                    }}
+                    onSelectWorkflow={(workflowId) => {
+                      const workflow = workflows.find(w => w.id === workflowId);
+                      if (workflow) {
+                        setEditingWorkflow(workflow);
+                        setShowWorkflowBuilder(true);
+                      }
+                    }}
+                  />
+                ) : (
+                  /* Vue liste */
+                  <>
+                    {/* Employees Grid */}
+                    {agents.filter(a => !selectedAreaId || a.functional_area_id === selectedAreaId).length > 0 ? (
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        {agents
+                          .filter(a => !selectedAreaId || a.functional_area_id === selectedAreaId)
+                          .map((agent) => (
+                          <div
+                            key={agent.id}
+                            className="bg-slate-800/50 border border-slate-700 rounded-2xl p-6 hover:border-slate-600 transition-all group"
                           >
-                            {agent.is_active ? "● Actif" : "○ Inactif"}
-                          </span>
-                          <span
-                            className={`text-xs px-2 py-1 rounded-full ${
-                              agent.scope === "enterprise"
-                                ? "bg-purple-500/20 text-purple-300"
-                                : "bg-amber-500/20 text-amber-300"
-                            }`}
-                          >
-                            {agent.scope === "enterprise" ? "🏢 Entreprise" : "🎯 Métier"}
-                          </span>
-                        </div>
+                            <div className="flex items-start justify-between mb-4">
+                              <span className="text-4xl">{agent.icon}</span>
+                              <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button className="p-2 bg-slate-700 hover:bg-blue-600 rounded-lg text-sm">
+                                  ✏️
+                                </button>
+                                <button className="p-2 bg-slate-700 hover:bg-red-600 rounded-lg text-sm">
+                                  🗑️
+                                </button>
+                              </div>
+                            </div>
+                            <h3 className="text-lg font-semibold text-white mb-2">{agent.name}</h3>
+                            <p className="text-sm text-slate-400 mb-4 line-clamp-2">
+                              {agent.description}
+                            </p>
+
+                            {/* Tools & Prompts */}
+                            <div className="flex flex-wrap gap-2 mb-4">
+                              {agent.mcp_tools.slice(0, 3).map((tool) => (
+                                <span
+                                  key={tool.id}
+                                  className="text-xs bg-slate-700 text-slate-300 px-2 py-1 rounded-full"
+                                >
+                                  {tool.icon} {tool.name}
+                                </span>
+                              ))}
+                              {agent.mcp_tools.length > 3 && (
+                                <span className="text-xs text-slate-500">
+                                  +{agent.mcp_tools.length - 3}
+                                </span>
+                              )}
+                            </div>
+
+                            {/* Status */}
+                            <div className="flex items-center justify-between pt-4 border-t border-slate-700">
+                              <span
+                                className={`text-xs px-2 py-1 rounded-full ${
+                                  agent.is_active
+                                    ? "bg-green-500/20 text-green-400"
+                                    : "bg-slate-600/50 text-slate-400"
+                                }`}
+                              >
+                                {agent.is_active ? "● Actif" : "○ Inactif"}
+                              </span>
+                              <span
+                                className={`text-xs px-2 py-1 rounded-full ${
+                                  agent.scope === "enterprise"
+                                    ? "bg-purple-500/20 text-purple-300"
+                                    : "bg-amber-500/20 text-amber-300"
+                                }`}
+                              >
+                                {agent.scope === "enterprise" ? "🏢 Entreprise" : "🎯 Métier"}
+                              </span>
+                            </div>
                       </div>
                     ))}
                   </div>
-                ) : (
-                  <div className="text-center py-16 bg-slate-800/30 border border-dashed border-slate-700 rounded-2xl">
-                    <span className="text-6xl block mb-4">🤖</span>
-                    <h3 className="text-xl font-semibold text-white mb-2">
-                      Créez votre premier employé virtuel
-                    </h3>
-                    <p className="text-slate-400 mb-6 max-w-md mx-auto">
-                      En quelques étapes, configurez un assistant IA qui travaillera pour vous 24/7
-                    </p>
-                    <button
-                      onClick={() => setShowWizard(true)}
-                      className="px-6 py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-xl font-medium"
-                    >
-                      Commencer →
-                    </button>
-                  </div>
+                    ) : (
+                      <div className="text-center py-16 bg-slate-800/30 border border-dashed border-slate-700 rounded-2xl">
+                        <span className="text-6xl block mb-4">🤖</span>
+                        <h3 className="text-xl font-semibold text-white mb-2">
+                          {selectedAreaId ? "Aucun employé dans ce périmètre" : "Créez votre premier employé virtuel"}
+                        </h3>
+                        <p className="text-slate-400 mb-6 max-w-md mx-auto">
+                          En quelques étapes, configurez un assistant IA qui travaillera pour vous 24/7
+                        </p>
+                        <button
+                          onClick={() => setShowWizard(true)}
+                          className="px-6 py-3 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-xl font-medium"
+                        >
+                          Commencer →
+                        </button>
+                      </div>
+                    )}
+                  </>
                 )}
               </>
             ) : (

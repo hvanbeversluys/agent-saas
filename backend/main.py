@@ -13,7 +13,8 @@ from datetime import datetime
 from database import (
     init_db, get_db, seed_demo_data,
     DBAgent, DBPrompt, DBMCPTool, DBConversation,
-    DBWorkflow, DBWorkflowTask, DBWorkflowExecution, DBScheduledJob
+    DBWorkflow, DBWorkflowTask, DBWorkflowExecution, DBScheduledJob,
+    DBFunctionalArea
 )
 
 app = FastAPI(title="Agent SaaS API", version="0.2.0")
@@ -37,6 +38,7 @@ class MCPToolBase(BaseModel):
     status: str = "active"
     scope: str = "business"  # enterprise | business
     config_required: List[str] = []
+    functional_area_id: Optional[str] = None
 
 class MCPToolCreate(MCPToolBase):
     pass
@@ -50,6 +52,7 @@ class MCPToolUpdate(BaseModel):
     scope: Optional[str] = None
     config_required: Optional[List[str]] = None
     config_values: Optional[dict] = None
+    functional_area_id: Optional[str] = None
 
 class MCPToolResponse(MCPToolBase):
     id: str
@@ -68,6 +71,7 @@ class PromptBase(BaseModel):
     template: str
     variables: List[str] = []
     mcp_tool_id: Optional[str] = None  # Lie le prompt à un outil MCP
+    functional_area_id: Optional[str] = None
 
 class PromptCreate(PromptBase):
     pass
@@ -80,6 +84,7 @@ class PromptUpdate(BaseModel):
     template: Optional[str] = None
     variables: Optional[List[str]] = None
     mcp_tool_id: Optional[str] = None
+    functional_area_id: Optional[str] = None
 
 class PromptResponse(PromptBase):
     id: str
@@ -102,6 +107,41 @@ class BusinessAction(BaseModel):
     variables: List[str]
     mcp_tool_name: Optional[str] = None
     mcp_tool_icon: Optional[str] = None
+    functional_area_id: Optional[str] = None
+    functional_area_name: Optional[str] = None
+
+
+# --- Périmètres Fonctionnels ---
+class FunctionalAreaBase(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    icon: str = "📁"
+    color: str = "blue"
+    order: str = "0"
+    is_active: bool = True
+
+class FunctionalAreaCreate(FunctionalAreaBase):
+    pass
+
+class FunctionalAreaUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    order: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class FunctionalAreaResponse(FunctionalAreaBase):
+    id: str
+    created_at: datetime
+    # Compteurs pour l'affichage
+    agents_count: int = 0
+    prompts_count: int = 0
+    workflows_count: int = 0
+    mcp_tools_count: int = 0
+    
+    class Config:
+        from_attributes = True
 
 
 class AgentBase(BaseModel):
@@ -112,6 +152,7 @@ class AgentBase(BaseModel):
     scope: str = "business"  # enterprise | business
     system_prompt: str
     is_active: bool = True
+    functional_area_id: Optional[str] = None
 
 class AgentCreate(AgentBase):
     mcp_tool_ids: List[str] = []
@@ -127,11 +168,13 @@ class AgentUpdate(BaseModel):
     is_active: Optional[bool] = None
     mcp_tool_ids: Optional[List[str]] = None
     prompt_ids: Optional[List[str]] = None
+    functional_area_id: Optional[str] = None
 
 class AgentResponse(AgentBase):
     id: str
     mcp_tools: List[MCPToolResponse] = []
     prompts: List[PromptResponse] = []
+    functional_area: Optional[FunctionalAreaBase] = None
     created_at: datetime
     
     class Config:
@@ -260,10 +303,16 @@ def get_mcp_categories(db: Session = Depends(get_db)):
 # ============================================================
 
 @app.get("/api/prompts", response_model=List[PromptResponse])
-def get_prompts(category: Optional[str] = None, db: Session = Depends(get_db)):
+def get_prompts(
+    category: Optional[str] = None,
+    functional_area_id: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
     query = db.query(DBPrompt)
     if category:
         query = query.filter(DBPrompt.category == category)
+    if functional_area_id:
+        query = query.filter(DBPrompt.functional_area_id == functional_area_id)
     return query.all()
 
 @app.get("/api/prompts/{prompt_id}", response_model=PromptResponse)
@@ -309,14 +358,172 @@ def delete_prompt(prompt_id: str, db: Session = Depends(get_db)):
 
 
 # ============================================================
+# 📁 PÉRIMÈTRES FONCTIONNELS CRUD
+# ============================================================
+
+@app.get("/api/functional-areas", response_model=List[FunctionalAreaResponse])
+def get_functional_areas(db: Session = Depends(get_db)):
+    """Liste tous les périmètres fonctionnels avec compteurs"""
+    areas = db.query(DBFunctionalArea).order_by(DBFunctionalArea.order).all()
+    
+    result = []
+    for area in areas:
+        area_dict = {
+            "id": area.id,
+            "name": area.name,
+            "description": area.description,
+            "icon": area.icon,
+            "color": area.color,
+            "order": area.order,
+            "is_active": area.is_active,
+            "created_at": area.created_at,
+            "agents_count": len(area.agents) if area.agents else 0,
+            "prompts_count": len(area.prompts) if area.prompts else 0,
+            "workflows_count": len(area.workflows) if area.workflows else 0,
+            "mcp_tools_count": len(area.mcp_tools) if area.mcp_tools else 0,
+        }
+        result.append(area_dict)
+    
+    return result
+
+@app.get("/api/functional-areas/{area_id}", response_model=FunctionalAreaResponse)
+def get_functional_area(area_id: str, db: Session = Depends(get_db)):
+    """Récupère un périmètre fonctionnel par ID"""
+    area = db.query(DBFunctionalArea).filter(DBFunctionalArea.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Functional area not found")
+    
+    return {
+        "id": area.id,
+        "name": area.name,
+        "description": area.description,
+        "icon": area.icon,
+        "color": area.color,
+        "order": area.order,
+        "is_active": area.is_active,
+        "created_at": area.created_at,
+        "agents_count": len(area.agents) if area.agents else 0,
+        "prompts_count": len(area.prompts) if area.prompts else 0,
+        "workflows_count": len(area.workflows) if area.workflows else 0,
+        "mcp_tools_count": len(area.mcp_tools) if area.mcp_tools else 0,
+    }
+
+@app.get("/api/functional-areas/{area_id}/details")
+def get_functional_area_details(area_id: str, db: Session = Depends(get_db)):
+    """Récupère un périmètre avec tous ses éléments liés"""
+    area = db.query(DBFunctionalArea).filter(DBFunctionalArea.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Functional area not found")
+    
+    return {
+        "id": area.id,
+        "name": area.name,
+        "description": area.description,
+        "icon": area.icon,
+        "color": area.color,
+        "agents": [{"id": a.id, "name": a.name, "icon": a.icon, "description": a.description} for a in area.agents],
+        "prompts": [{"id": p.id, "name": p.name, "description": p.description, "category": p.category} for p in area.prompts],
+        "workflows": [{"id": w.id, "name": w.name, "description": w.description, "trigger_type": w.trigger_type} for w in area.workflows],
+        "mcp_tools": [{"id": t.id, "name": t.name, "icon": t.icon, "status": t.status} for t in area.mcp_tools],
+    }
+
+@app.post("/api/functional-areas", response_model=FunctionalAreaResponse)
+def create_functional_area(area: FunctionalAreaCreate, db: Session = Depends(get_db)):
+    """Crée un nouveau périmètre fonctionnel"""
+    db_area = DBFunctionalArea(
+        id=str(uuid.uuid4()),
+        name=area.name,
+        description=area.description,
+        icon=area.icon,
+        color=area.color,
+        order=area.order,
+        is_active=area.is_active
+    )
+    db.add(db_area)
+    db.commit()
+    db.refresh(db_area)
+    
+    return {
+        "id": db_area.id,
+        "name": db_area.name,
+        "description": db_area.description,
+        "icon": db_area.icon,
+        "color": db_area.color,
+        "order": db_area.order,
+        "is_active": db_area.is_active,
+        "created_at": db_area.created_at,
+        "agents_count": 0,
+        "prompts_count": 0,
+        "workflows_count": 0,
+        "mcp_tools_count": 0,
+    }
+
+@app.put("/api/functional-areas/{area_id}", response_model=FunctionalAreaResponse)
+def update_functional_area(area_id: str, area: FunctionalAreaUpdate, db: Session = Depends(get_db)):
+    """Met à jour un périmètre fonctionnel"""
+    db_area = db.query(DBFunctionalArea).filter(DBFunctionalArea.id == area_id).first()
+    if not db_area:
+        raise HTTPException(status_code=404, detail="Functional area not found")
+    
+    update_data = area.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_area, field, value)
+    
+    db.commit()
+    db.refresh(db_area)
+    
+    return {
+        "id": db_area.id,
+        "name": db_area.name,
+        "description": db_area.description,
+        "icon": db_area.icon,
+        "color": db_area.color,
+        "order": db_area.order,
+        "is_active": db_area.is_active,
+        "created_at": db_area.created_at,
+        "agents_count": len(db_area.agents) if db_area.agents else 0,
+        "prompts_count": len(db_area.prompts) if db_area.prompts else 0,
+        "workflows_count": len(db_area.workflows) if db_area.workflows else 0,
+        "mcp_tools_count": len(db_area.mcp_tools) if db_area.mcp_tools else 0,
+    }
+
+@app.delete("/api/functional-areas/{area_id}")
+def delete_functional_area(area_id: str, db: Session = Depends(get_db)):
+    """Supprime un périmètre fonctionnel"""
+    db_area = db.query(DBFunctionalArea).filter(DBFunctionalArea.id == area_id).first()
+    if not db_area:
+        raise HTTPException(status_code=404, detail="Functional area not found")
+    
+    # Dissocier les éléments liés (ne pas les supprimer)
+    for agent in db_area.agents:
+        agent.functional_area_id = None
+    for prompt in db_area.prompts:
+        prompt.functional_area_id = None
+    for workflow in db_area.workflows:
+        workflow.functional_area_id = None
+    for tool in db_area.mcp_tools:
+        tool.functional_area_id = None
+    
+    db.delete(db_area)
+    db.commit()
+    return {"message": "Functional area deleted"}
+
+
+# ============================================================
 # 🤖 AGENTS CRUD
 # ============================================================
 
 @app.get("/api/agents", response_model=List[AgentResponse])
-def get_agents(category: Optional[str] = None, db: Session = Depends(get_db)):
+def get_agents(
+    category: Optional[str] = None, 
+    functional_area_id: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
     query = db.query(DBAgent)
     if category:
         query = query.filter(DBAgent.category == category)
+    if functional_area_id:
+        query = query.filter(DBAgent.functional_area_id == functional_area_id)
     return query.all()
 
 @app.get("/api/agents/{agent_id}", response_model=AgentResponse)
@@ -851,14 +1058,17 @@ class WorkflowExecutionResponse(BaseModel):
 def get_workflows(
     agent_id: Optional[str] = None,
     is_active: Optional[bool] = None,
+    functional_area_id: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Liste tous les workflows, optionnellement filtrés par agent"""
+    """Liste tous les workflows, optionnellement filtrés par agent ou périmètre"""
     query = db.query(DBWorkflow)
     if agent_id:
         query = query.filter(DBWorkflow.agent_id == agent_id)
     if is_active is not None:
         query = query.filter(DBWorkflow.is_active == is_active)
+    if functional_area_id:
+        query = query.filter(DBWorkflow.functional_area_id == functional_area_id)
     return query.all()
 
 @app.get("/api/workflows/{workflow_id}", response_model=WorkflowResponse)
