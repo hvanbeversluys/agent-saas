@@ -95,11 +95,12 @@ class LLMRouter:
     """
     
     # Model preferences by tier (fallback chain)
+    # Updated December 2024
     MODEL_TIERS = {
         "free": [
-            ("groq", "llama-3.1-70b-versatile"),
-            ("groq", "llama-3.1-8b-instant"),
-            ("groq", "mixtral-8x7b-32768"),
+            ("groq", "llama-3.3-70b-versatile"),   # Latest Llama 3.3
+            ("groq", "llama-3.1-8b-instant"),       # Fast
+            ("groq", "mixtral-8x7b-32768"),         # Large context
         ],
         "cheap": [
             ("openai", "gpt-4o-mini"),

@@ -41,17 +41,19 @@ class GroqProvider(LLMProvider):
     supports_tools = True
     supports_vision = False
     
+    # Updated models list - December 2024
+    # See: https://console.groq.com/docs/models
     MODELS = [
-        "llama-3.1-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama-3.2-90b-vision-preview",
-        "llama3-groq-70b-8192-tool-use-preview",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it",
+        "llama-3.3-70b-versatile",      # Latest Llama 3.3
+        "llama-3.1-8b-instant",          # Fast, small
+        "llama-3.2-90b-vision-preview",  # Vision capable
+        "llama3-groq-70b-8192-tool-use-preview",  # Tool use
+        "mixtral-8x7b-32768",            # Large context
+        "gemma2-9b-it",                  # Google Gemma
     ]
     
     def _configure(self, **kwargs):
-        self.default_model = kwargs.get("default_model", "llama-3.1-70b-versatile")
+        self.default_model = kwargs.get("default_model", "llama-3.3-70b-versatile")
         self.timeout = kwargs.get("timeout", 30.0)
     
     @property

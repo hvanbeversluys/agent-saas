@@ -153,6 +153,7 @@ class LLMProvider(ABC):
 
 
 # Model capability ratings (1-5)
+# Updated December 2024
 MODEL_CAPABILITIES = {
     # OpenAI
     "gpt-4o": {"reasoning": 5, "creativity": 5, "speed": 4, "cost": 3},
@@ -165,10 +166,11 @@ MODEL_CAPABILITIES = {
     "claude-3-5-haiku-20241022": {"reasoning": 4, "creativity": 4, "speed": 5, "cost": 5},
     "claude-3-opus-20240229": {"reasoning": 5, "creativity": 5, "speed": 2, "cost": 1},
     
-    # Groq (Free!)
-    "llama-3.1-70b-versatile": {"reasoning": 4, "creativity": 4, "speed": 5, "cost": 5},
+    # Groq (Free!) - Updated December 2024
+    "llama-3.3-70b-versatile": {"reasoning": 5, "creativity": 4, "speed": 5, "cost": 5},  # Latest!
     "llama-3.1-8b-instant": {"reasoning": 3, "creativity": 3, "speed": 5, "cost": 5},
     "mixtral-8x7b-32768": {"reasoning": 4, "creativity": 4, "speed": 5, "cost": 5},
+    "gemma2-9b-it": {"reasoning": 3, "creativity": 3, "speed": 5, "cost": 5},
     
     # Google
     "gemini-1.5-flash": {"reasoning": 4, "creativity": 4, "speed": 5, "cost": 5},
