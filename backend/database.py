@@ -2,11 +2,14 @@
 Database configuration avec SQLite pour le MVP.
 Facilement migrable vers PostgreSQL plus tard.
 """
-from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, JSON, ForeignKey, Table
+from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, JSON, ForeignKey, Table, Integer, Float, Enum as SQLEnum
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
 import uuid
+import secrets
+import hashlib
 
 # SQLite database (fichier local)
 DATABASE_URL = "sqlite:///./agent_saas.db"
@@ -22,6 +25,316 @@ Base = declarative_base()
 # --- Helper pour générer des UUIDs ---
 def generate_uuid():
     return str(uuid.uuid4())
+
+def hash_password(password: str) -> str:
+    """Hash simple pour le MVP - utiliser bcrypt en prod"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(password: str, hashed: str) -> bool:
+    return hash_password(password) == hashed
+
+def generate_api_key():
+    return f"ask_{secrets.token_urlsafe(32)}"
+
+
+# ============================================================
+# 🏢 MULTI-TENANCY : Tenant (Entreprise)
+# ============================================================
+
+class SubscriptionPlan(str, Enum):
+    FREE = "free"
+    STARTER = "starter"
+    BUSINESS = "business"
+    ENTERPRISE = "enterprise"
+    CUSTOM = "custom"
+
+class SubscriptionStatus(str, Enum):
+    TRIAL = "trial"
+    ACTIVE = "active"
+    PAST_DUE = "past_due"
+    CANCELLED = "cancelled"
+    SUSPENDED = "suspended"
+
+class DBTenant(Base):
+    """Entreprise cliente - Tenant principal pour le multi-tenancy"""
+    __tablename__ = "tenants"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    name = Column(String(200), nullable=False)  # Nom de l'entreprise
+    slug = Column(String(100), unique=True, nullable=False)  # URL-friendly identifier
+    
+    # Contact
+    email = Column(String(255), nullable=False)
+    phone = Column(String(50))
+    address = Column(Text)
+    
+    # Branding
+    logo_url = Column(String(500))
+    primary_color = Column(String(20), default="#6366f1")
+    
+    # Subscription
+    plan = Column(String(20), default=SubscriptionPlan.FREE.value)
+    subscription_status = Column(String(20), default=SubscriptionStatus.TRIAL.value)
+    trial_ends_at = Column(DateTime)
+    subscription_ends_at = Column(DateTime)
+    
+    # Limites selon le plan
+    max_users = Column(Integer, default=3)
+    max_agents = Column(Integer, default=5)
+    max_workflows = Column(Integer, default=10)
+    max_executions_per_month = Column(Integer, default=500)
+    
+    # Stripe/Billing
+    stripe_customer_id = Column(String(100))
+    stripe_subscription_id = Column(String(100))
+    
+    # Metadata
+    settings = Column(JSON, default=dict)  # Paramètres custom
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relations
+    users = relationship("DBUser", back_populates="tenant", cascade="all, delete-orphan")
+    api_keys = relationship("DBAPIKey", back_populates="tenant", cascade="all, delete-orphan")
+    usage_records = relationship("DBUsageRecord", back_populates="tenant", cascade="all, delete-orphan")
+    invoices = relationship("DBInvoice", back_populates="tenant", cascade="all, delete-orphan")
+
+
+# ============================================================
+# 👤 USERS & AUTH
+# ============================================================
+
+class UserRole(str, Enum):
+    OWNER = "owner"          # Propriétaire - tous les droits
+    ADMIN = "admin"          # Admin - gestion users + config
+    MANAGER = "manager"      # Manager - gestion agents/workflows
+    MEMBER = "member"        # Membre - utilisation seule
+    VIEWER = "viewer"        # Lecture seule
+
+class DBUser(Base):
+    """Utilisateur d'une entreprise"""
+    __tablename__ = "users"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=False)
+    
+    # Auth
+    email = Column(String(255), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    
+    # Profile
+    first_name = Column(String(100))
+    last_name = Column(String(100))
+    avatar_url = Column(String(500))
+    job_title = Column(String(100))
+    phone = Column(String(50))
+    
+    # Rôle & Permissions
+    role = Column(String(20), default=UserRole.MEMBER.value)
+    permissions = Column(JSON, default=list)  # Permissions spécifiques additionnelles
+    
+    # Préférences
+    preferences = Column(JSON, default=dict)  # {theme: "dark", language: "fr", ...}
+    notification_settings = Column(JSON, default=dict)
+    
+    # Status
+    is_active = Column(Boolean, default=True)
+    email_verified = Column(Boolean, default=False)
+    last_login_at = Column(DateTime)
+    
+    # MFA (optionnel)
+    mfa_enabled = Column(Boolean, default=False)
+    mfa_secret = Column(String(100))
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relations
+    tenant = relationship("DBTenant", back_populates="users")
+    sessions = relationship("DBSession", back_populates="user", cascade="all, delete-orphan")
+    
+    @property
+    def full_name(self):
+        return f"{self.first_name or ''} {self.last_name or ''}".strip() or self.email
+
+
+class DBSession(Base):
+    """Session utilisateur (JWT refresh tokens)"""
+    __tablename__ = "sessions"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey('users.id'), nullable=False)
+    
+    refresh_token = Column(String(255), unique=True, nullable=False)
+    user_agent = Column(String(500))
+    ip_address = Column(String(50))
+    
+    expires_at = Column(DateTime, nullable=False)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relations
+    user = relationship("DBUser", back_populates="sessions")
+
+
+class DBAPIKey(Base):
+    """Clés API pour intégrations externes"""
+    __tablename__ = "api_keys"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=False)
+    created_by_user_id = Column(String, ForeignKey('users.id'))
+    
+    name = Column(String(100), nullable=False)  # Ex: "Production API", "Dev API"
+    key_hash = Column(String(255), nullable=False)  # Hash de la clé
+    key_prefix = Column(String(20), nullable=False)  # "ask_abc123..." pour identification
+    
+    # Permissions
+    scopes = Column(JSON, default=list)  # ["agents:read", "workflows:execute", ...]
+    
+    # Limites
+    rate_limit_per_minute = Column(Integer, default=60)
+    
+    # Status
+    is_active = Column(Boolean, default=True)
+    last_used_at = Column(DateTime)
+    expires_at = Column(DateTime)  # Null = pas d'expiration
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relations
+    tenant = relationship("DBTenant", back_populates="api_keys")
+
+
+# ============================================================
+# 📊 USAGE TRACKING & BILLING
+# ============================================================
+
+class UsageType(str, Enum):
+    WORKFLOW_EXECUTION = "workflow_execution"
+    AGENT_CALL = "agent_call"
+    MCP_TOOL_CALL = "mcp_tool_call"
+    LLM_TOKENS = "llm_tokens"
+    STORAGE_MB = "storage_mb"
+
+class DBUsageRecord(Base):
+    """Enregistrement d'utilisation pour facturation"""
+    __tablename__ = "usage_records"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=False)
+    user_id = Column(String, ForeignKey('users.id'))
+    
+    # Type d'usage
+    usage_type = Column(String(50), nullable=False)
+    
+    # Quantité
+    quantity = Column(Integer, default=1)
+    unit = Column(String(20), default="count")  # count, tokens, mb
+    
+    # Context
+    resource_id = Column(String)  # ID du workflow/agent concerné
+    resource_type = Column(String(50))  # workflow, agent, mcp_tool
+    extra_data = Column(JSON, default=dict)  # Détails additionnels
+    
+    # Billing period
+    billing_period = Column(String(7))  # "2024-01" format
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relations
+    tenant = relationship("DBTenant", back_populates="usage_records")
+
+
+class InvoiceStatus(str, Enum):
+    DRAFT = "draft"
+    PENDING = "pending"
+    PAID = "paid"
+    OVERDUE = "overdue"
+    CANCELLED = "cancelled"
+
+class DBInvoice(Base):
+    """Factures générées"""
+    __tablename__ = "invoices"
+    
+    id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=False)
+    
+    # Numérotation
+    invoice_number = Column(String(50), unique=True, nullable=False)
+    
+    # Période
+    billing_period_start = Column(DateTime, nullable=False)
+    billing_period_end = Column(DateTime, nullable=False)
+    
+    # Montants
+    subtotal = Column(Float, default=0.0)  # HT
+    tax_rate = Column(Float, default=0.20)  # TVA 20%
+    tax_amount = Column(Float, default=0.0)
+    total = Column(Float, default=0.0)  # TTC
+    currency = Column(String(3), default="EUR")
+    
+    # Détails
+    line_items = Column(JSON, default=list)  # [{description, quantity, unit_price, total}]
+    
+    # Status
+    status = Column(String(20), default=InvoiceStatus.DRAFT.value)
+    
+    # Paiement
+    paid_at = Column(DateTime)
+    payment_method = Column(String(50))
+    stripe_invoice_id = Column(String(100))
+    
+    # PDF
+    pdf_url = Column(String(500))
+    
+    due_date = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relations
+    tenant = relationship("DBTenant", back_populates="invoices")
+
+
+# ============================================================
+# 🔑 PERMISSIONS SYSTEM
+# ============================================================
+
+# Définition des permissions par ressource
+PERMISSIONS = {
+    "agents": ["create", "read", "update", "delete", "execute"],
+    "prompts": ["create", "read", "update", "delete"],
+    "workflows": ["create", "read", "update", "delete", "execute"],
+    "mcp_tools": ["create", "read", "update", "delete", "configure"],
+    "users": ["create", "read", "update", "delete", "invite"],
+    "billing": ["read", "manage"],
+    "settings": ["read", "update"],
+    "api_keys": ["create", "read", "delete"],
+}
+
+# Permissions par rôle
+ROLE_PERMISSIONS = {
+    UserRole.OWNER.value: "*",  # Tous les droits
+    UserRole.ADMIN.value: [
+        "agents:*", "prompts:*", "workflows:*", "mcp_tools:*",
+        "users:create", "users:read", "users:update", "users:invite",
+        "settings:*", "api_keys:*", "billing:read"
+    ],
+    UserRole.MANAGER.value: [
+        "agents:*", "prompts:*", "workflows:*", "mcp_tools:read", "mcp_tools:configure",
+        "users:read", "settings:read"
+    ],
+    UserRole.MEMBER.value: [
+        "agents:read", "agents:execute",
+        "prompts:read",
+        "workflows:read", "workflows:execute",
+        "mcp_tools:read"
+    ],
+    UserRole.VIEWER.value: [
+        "agents:read", "prompts:read", "workflows:read", "mcp_tools:read"
+    ],
+}
+
 
 # --- Table de liaison Agent <-> MCP Tools (Many-to-Many) ---
 agent_mcp_tools = Table(
@@ -46,6 +359,8 @@ class DBFunctionalArea(Base):
     __tablename__ = "functional_areas"
     
     id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True)  # Null = template global
+    
     name = Column(String(100), nullable=False)
     description = Column(Text)
     icon = Column(String(10), default="📁")
@@ -68,6 +383,8 @@ class DBAgent(Base):
     __tablename__ = "agents"
     
     id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True)  # Null = template global
+    
     name = Column(String(100), nullable=False)
     description = Column(Text)
     icon = Column(String(10), default="🤖")
@@ -93,6 +410,8 @@ class DBPrompt(Base):
     __tablename__ = "prompts"
     
     id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True)  # Null = template global
+    
     name = Column(String(100), nullable=False)
     description = Column(Text)
     category = Column(String(50), default="general")
@@ -120,6 +439,8 @@ class DBMCPTool(Base):
     __tablename__ = "mcp_tools"
     
     id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True)  # Null = template global
+    
     name = Column(String(100), nullable=False)
     description = Column(Text)
     icon = Column(String(10), default="🔌")
@@ -145,6 +466,9 @@ class DBConversation(Base):
     __tablename__ = "conversations"
     
     id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True)
+    user_id = Column(String, ForeignKey('users.id'), nullable=True)
+    
     agent_id = Column(String, ForeignKey('agents.id'), nullable=True)
     messages = Column(JSON, default=list)  # [{role: "user", content: "..."}, ...]
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -158,6 +482,8 @@ class DBWorkflow(Base):
     __tablename__ = "workflows"
     
     id = Column(String, primary_key=True, default=generate_uuid)
+    tenant_id = Column(String, ForeignKey('tenants.id'), nullable=True)  # Null = template global
+    
     name = Column(String(100), nullable=False)
     description = Column(Text)
     agent_id = Column(String, ForeignKey('agents.id'), nullable=False)

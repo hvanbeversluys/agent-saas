@@ -1,23 +1,41 @@
 """
 Agent SaaS API - Backend avec SQLite
 MVP avec CRUD complet pour agents, prompts et MCP tools
++ Auth JWT + Multi-tenancy
 """
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from sqlalchemy.orm import Session
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+import jwt
+import os
 
 from database import (
     init_db, get_db, seed_demo_data,
     DBAgent, DBPrompt, DBMCPTool, DBConversation,
     DBWorkflow, DBWorkflowTask, DBWorkflowExecution, DBScheduledJob,
-    DBFunctionalArea
+    DBFunctionalArea,
+    # Auth & Multi-tenancy
+    DBTenant, DBUser, DBSession, DBAPIKey,
+    DBUsageRecord, DBInvoice,
+    SubscriptionPlan, SubscriptionStatus, UserRole,
+    ROLE_PERMISSIONS, PERMISSIONS,
+    hash_password, verify_password, generate_api_key, generate_uuid
 )
 
-app = FastAPI(title="Agent SaaS API", version="0.2.0")
+# --- JWT Configuration ---
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production-1234567890")
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60
+JWT_REFRESH_TOKEN_EXPIRE_DAYS = 30
+
+security = HTTPBearer(auto_error=False)
+
+app = FastAPI(title="Agent SaaS API", version="0.3.0")
 
 # Configuration CORS
 app.add_middleware(
@@ -205,6 +223,218 @@ class ChatResponse(BaseModel):
     handoff: Optional[HandoffInfo] = None
 
 
+# ============================================================
+# 🔐 AUTH SCHEMAS
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company_name: str
+    company_slug: Optional[str] = None  # Auto-généré si non fourni
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user: "UserResponse"
+    tenant: "TenantResponse"
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    first_name: Optional[str]
+    last_name: Optional[str]
+    full_name: str
+    avatar_url: Optional[str]
+    job_title: Optional[str]
+    role: str
+    is_active: bool
+    email_verified: bool
+    
+    class Config:
+        from_attributes = True
+
+class UserUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    job_title: Optional[str] = None
+    phone: Optional[str] = None
+    preferences: Optional[dict] = None
+    notification_settings: Optional[dict] = None
+
+class TenantResponse(BaseModel):
+    id: str
+    name: str
+    slug: str
+    email: str
+    logo_url: Optional[str]
+    primary_color: str
+    plan: str
+    subscription_status: str
+    max_users: int
+    max_agents: int
+    max_workflows: int
+    max_executions_per_month: int
+    
+    class Config:
+        from_attributes = True
+
+class TenantUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    logo_url: Optional[str] = None
+    primary_color: Optional[str] = None
+    settings: Optional[dict] = None
+
+class InviteUserRequest(BaseModel):
+    email: EmailStr
+    role: str = "member"
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+class UsageStatsResponse(BaseModel):
+    current_period: str
+    workflow_executions: int
+    agent_calls: int
+    mcp_tool_calls: int
+    limits: dict
+    usage_percentage: dict
+
+
+# ============================================================
+# 🔐 AUTH HELPERS
+# ============================================================
+
+def create_access_token(user_id: str, tenant_id: str) -> str:
+    """Crée un JWT access token"""
+    expires = datetime.utcnow() + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": user_id,
+        "tenant_id": tenant_id,
+        "exp": expires,
+        "type": "access"
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def create_refresh_token(user_id: str) -> str:
+    """Crée un refresh token"""
+    expires = datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    payload = {
+        "sub": user_id,
+        "exp": expires,
+        "type": "refresh",
+        "jti": generate_uuid()  # Unique ID pour révocation
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    """Décode et valide un JWT"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expiré")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token invalide")
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> DBUser:
+    """Dependency pour récupérer l'utilisateur authentifié"""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Non authentifié")
+    
+    payload = decode_token(credentials.credentials)
+    
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Type de token invalide")
+    
+    user = db.query(DBUser).filter(DBUser.id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Utilisateur non trouvé")
+    
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Compte désactivé")
+    
+    return user
+
+def get_optional_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> Optional[DBUser]:
+    """Dependency optionnelle - retourne None si pas authentifié"""
+    if not credentials:
+        return None
+    
+    try:
+        payload = decode_token(credentials.credentials)
+        if payload.get("type") != "access":
+            return None
+        user = db.query(DBUser).filter(DBUser.id == payload["sub"]).first()
+        return user if user and user.is_active else None
+    except:
+        return None
+
+def check_permission(user: DBUser, resource: str, action: str) -> bool:
+    """Vérifie si l'utilisateur a la permission"""
+    role_perms = ROLE_PERMISSIONS.get(user.role, [])
+    
+    # Owner a tous les droits
+    if role_perms == "*":
+        return True
+    
+    # Vérifier permission exacte ou wildcard
+    full_perm = f"{resource}:{action}"
+    wildcard_perm = f"{resource}:*"
+    
+    if full_perm in role_perms or wildcard_perm in role_perms:
+        return True
+    
+    # Vérifier permissions additionnelles
+    if user.permissions and full_perm in user.permissions:
+        return True
+    
+    return False
+
+def require_permission(resource: str, action: str):
+    """Décorateur/Dependency pour vérifier les permissions"""
+    def permission_checker(user: DBUser = Depends(get_current_user)):
+        if not check_permission(user, resource, action):
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Permission refusée: {resource}:{action}"
+            )
+        return user
+    return permission_checker
+
+def slugify(text: str) -> str:
+    """Convertit un texte en slug URL-friendly"""
+    import re
+    text = text.lower()
+    text = re.sub(r'[^\w\s-]', '', text)
+    text = re.sub(r'[\s_-]+', '-', text)
+    return text.strip('-')
+
+
 # --- Startup event ---
 
 @app.on_event("startup")
@@ -219,11 +449,610 @@ def startup():
 
 @app.get("/")
 def read_root():
-    return {"message": "Agent SaaS Backend is running 🚀", "version": "0.2.0"}
+    return {"message": "Agent SaaS Backend is running 🚀", "version": "0.3.0"}
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
+
+
+# ============================================================
+# 🔐 AUTH ENDPOINTS
+# ============================================================
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+def register(
+    data: RegisterRequest,
+    db: Session = Depends(get_db)
+):
+    """Inscription d'une nouvelle entreprise + utilisateur owner"""
+    
+    # Vérifier si l'email existe déjà
+    existing_user = db.query(DBUser).filter(DBUser.email == data.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Cet email est déjà utilisé")
+    
+    # Générer le slug si non fourni
+    slug = data.company_slug or slugify(data.company_name)
+    
+    # Vérifier si le slug existe
+    existing_tenant = db.query(DBTenant).filter(DBTenant.slug == slug).first()
+    if existing_tenant:
+        slug = f"{slug}-{generate_uuid()[:8]}"
+    
+    # Créer le tenant (entreprise)
+    tenant = DBTenant(
+        name=data.company_name,
+        slug=slug,
+        email=data.email,
+        plan=SubscriptionPlan.FREE.value,
+        subscription_status=SubscriptionStatus.TRIAL.value,
+        trial_ends_at=datetime.utcnow() + timedelta(days=14),
+        max_users=3,
+        max_agents=5,
+        max_workflows=10,
+        max_executions_per_month=500
+    )
+    db.add(tenant)
+    db.flush()  # Pour avoir l'ID
+    
+    # Créer l'utilisateur owner
+    user = DBUser(
+        tenant_id=tenant.id,
+        email=data.email,
+        password_hash=hash_password(data.password),
+        first_name=data.first_name,
+        last_name=data.last_name,
+        role=UserRole.OWNER.value,
+        email_verified=False  # À implémenter: email de vérification
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    db.refresh(tenant)
+    
+    # Générer les tokens
+    access_token = create_access_token(user.id, tenant.id)
+    refresh_token = create_refresh_token(user.id)
+    
+    # Sauvegarder la session
+    session = DBSession(
+        user_id=user.id,
+        refresh_token=refresh_token,
+        expires_at=datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(session)
+    db.commit()
+    
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            full_name=user.full_name,
+            avatar_url=user.avatar_url,
+            job_title=user.job_title,
+            role=user.role,
+            is_active=user.is_active,
+            email_verified=user.email_verified
+        ),
+        tenant=TenantResponse(
+            id=tenant.id,
+            name=tenant.name,
+            slug=tenant.slug,
+            email=tenant.email,
+            logo_url=tenant.logo_url,
+            primary_color=tenant.primary_color,
+            plan=tenant.plan,
+            subscription_status=tenant.subscription_status,
+            max_users=tenant.max_users,
+            max_agents=tenant.max_agents,
+            max_workflows=tenant.max_workflows,
+            max_executions_per_month=tenant.max_executions_per_month
+        )
+    )
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(
+    data: LoginRequest,
+    db: Session = Depends(get_db)
+):
+    """Connexion utilisateur"""
+    
+    user = db.query(DBUser).filter(DBUser.email == data.email).first()
+    
+    if not user or not verify_password(data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect")
+    
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Compte désactivé")
+    
+    tenant = db.query(DBTenant).filter(DBTenant.id == user.tenant_id).first()
+    if not tenant or not tenant.is_active:
+        raise HTTPException(status_code=403, detail="Entreprise désactivée")
+    
+    # Mettre à jour last_login
+    user.last_login_at = datetime.utcnow()
+    
+    # Générer les tokens
+    access_token = create_access_token(user.id, tenant.id)
+    refresh_token = create_refresh_token(user.id)
+    
+    # Sauvegarder la session
+    session = DBSession(
+        user_id=user.id,
+        refresh_token=refresh_token,
+        expires_at=datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(session)
+    db.commit()
+    
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            full_name=user.full_name,
+            avatar_url=user.avatar_url,
+            job_title=user.job_title,
+            role=user.role,
+            is_active=user.is_active,
+            email_verified=user.email_verified
+        ),
+        tenant=TenantResponse(
+            id=tenant.id,
+            name=tenant.name,
+            slug=tenant.slug,
+            email=tenant.email,
+            logo_url=tenant.logo_url,
+            primary_color=tenant.primary_color,
+            plan=tenant.plan,
+            subscription_status=tenant.subscription_status,
+            max_users=tenant.max_users,
+            max_agents=tenant.max_agents,
+            max_workflows=tenant.max_workflows,
+            max_executions_per_month=tenant.max_executions_per_month
+        )
+    )
+
+
+@app.post("/api/auth/refresh", response_model=TokenResponse)
+def refresh_token(
+    data: RefreshTokenRequest,
+    db: Session = Depends(get_db)
+):
+    """Rafraîchir les tokens"""
+    
+    payload = decode_token(data.refresh_token)
+    
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Token invalide")
+    
+    # Vérifier la session
+    session = db.query(DBSession).filter(
+        DBSession.refresh_token == data.refresh_token,
+        DBSession.revoked == False
+    ).first()
+    
+    if not session:
+        raise HTTPException(status_code=401, detail="Session invalide")
+    
+    user = db.query(DBUser).filter(DBUser.id == payload["sub"]).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Utilisateur invalide")
+    
+    tenant = db.query(DBTenant).filter(DBTenant.id == user.tenant_id).first()
+    
+    # Révoquer l'ancienne session
+    session.revoked = True
+    
+    # Créer nouveaux tokens
+    access_token = create_access_token(user.id, tenant.id)
+    new_refresh_token = create_refresh_token(user.id)
+    
+    # Nouvelle session
+    new_session = DBSession(
+        user_id=user.id,
+        refresh_token=new_refresh_token,
+        expires_at=datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(new_session)
+    db.commit()
+    
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        expires_in=JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            full_name=user.full_name,
+            avatar_url=user.avatar_url,
+            job_title=user.job_title,
+            role=user.role,
+            is_active=user.is_active,
+            email_verified=user.email_verified
+        ),
+        tenant=TenantResponse(
+            id=tenant.id,
+            name=tenant.name,
+            slug=tenant.slug,
+            email=tenant.email,
+            logo_url=tenant.logo_url,
+            primary_color=tenant.primary_color,
+            plan=tenant.plan,
+            subscription_status=tenant.subscription_status,
+            max_users=tenant.max_users,
+            max_agents=tenant.max_agents,
+            max_workflows=tenant.max_workflows,
+            max_executions_per_month=tenant.max_executions_per_month
+        )
+    )
+
+
+@app.post("/api/auth/logout")
+def logout(
+    user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Déconnexion - révoque toutes les sessions"""
+    
+    db.query(DBSession).filter(
+        DBSession.user_id == user.id,
+        DBSession.revoked == False
+    ).update({"revoked": True})
+    db.commit()
+    
+    return {"message": "Déconnexion réussie"}
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+def get_current_user_info(
+    user: DBUser = Depends(get_current_user)
+):
+    """Récupère les infos de l'utilisateur connecté"""
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        full_name=user.full_name,
+        avatar_url=user.avatar_url,
+        job_title=user.job_title,
+        role=user.role,
+        is_active=user.is_active,
+        email_verified=user.email_verified
+    )
+
+
+@app.put("/api/auth/me", response_model=UserResponse)
+def update_current_user(
+    data: UserUpdate,
+    user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Met à jour le profil de l'utilisateur connecté"""
+    
+    if data.first_name is not None:
+        user.first_name = data.first_name
+    if data.last_name is not None:
+        user.last_name = data.last_name
+    if data.avatar_url is not None:
+        user.avatar_url = data.avatar_url
+    if data.job_title is not None:
+        user.job_title = data.job_title
+    if data.phone is not None:
+        user.phone = data.phone
+    if data.preferences is not None:
+        user.preferences = data.preferences
+    if data.notification_settings is not None:
+        user.notification_settings = data.notification_settings
+    
+    db.commit()
+    db.refresh(user)
+    
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        full_name=user.full_name,
+        avatar_url=user.avatar_url,
+        job_title=user.job_title,
+        role=user.role,
+        is_active=user.is_active,
+        email_verified=user.email_verified
+    )
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    data: ChangePasswordRequest,
+    user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Change le mot de passe de l'utilisateur"""
+    
+    if not verify_password(data.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Mot de passe actuel incorrect")
+    
+    user.password_hash = hash_password(data.new_password)
+    
+    # Révoquer toutes les sessions sauf la courante
+    db.query(DBSession).filter(
+        DBSession.user_id == user.id
+    ).update({"revoked": True})
+    
+    db.commit()
+    
+    return {"message": "Mot de passe changé avec succès"}
+
+
+# ============================================================
+# 👥 USER MANAGEMENT (Admin)
+# ============================================================
+
+@app.get("/api/users", response_model=List[UserResponse])
+def list_users(
+    user: DBUser = Depends(require_permission("users", "read")),
+    db: Session = Depends(get_db)
+):
+    """Liste les utilisateurs de l'entreprise"""
+    users = db.query(DBUser).filter(DBUser.tenant_id == user.tenant_id).all()
+    return [
+        UserResponse(
+            id=u.id,
+            email=u.email,
+            first_name=u.first_name,
+            last_name=u.last_name,
+            full_name=u.full_name,
+            avatar_url=u.avatar_url,
+            job_title=u.job_title,
+            role=u.role,
+            is_active=u.is_active,
+            email_verified=u.email_verified
+        ) for u in users
+    ]
+
+
+@app.post("/api/users/invite", response_model=UserResponse)
+def invite_user(
+    data: InviteUserRequest,
+    user: DBUser = Depends(require_permission("users", "invite")),
+    db: Session = Depends(get_db)
+):
+    """Invite un nouvel utilisateur dans l'entreprise"""
+    
+    tenant = db.query(DBTenant).filter(DBTenant.id == user.tenant_id).first()
+    
+    # Vérifier la limite d'utilisateurs
+    current_users = db.query(DBUser).filter(DBUser.tenant_id == tenant.id).count()
+    if current_users >= tenant.max_users:
+        raise HTTPException(
+            status_code=403, 
+            detail=f"Limite de {tenant.max_users} utilisateurs atteinte. Passez à un plan supérieur."
+        )
+    
+    # Vérifier si l'email existe
+    existing = db.query(DBUser).filter(DBUser.email == data.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Cet email est déjà utilisé")
+    
+    # Vérifier le rôle (ne peut pas créer un owner)
+    if data.role == UserRole.OWNER.value:
+        raise HTTPException(status_code=403, detail="Impossible de créer un owner")
+    
+    # Créer l'utilisateur avec mot de passe temporaire
+    temp_password = generate_uuid()[:12]
+    new_user = DBUser(
+        tenant_id=tenant.id,
+        email=data.email,
+        password_hash=hash_password(temp_password),
+        first_name=data.first_name,
+        last_name=data.last_name,
+        role=data.role,
+        email_verified=False
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # TODO: Envoyer email d'invitation avec lien de reset password
+    
+    return UserResponse(
+        id=new_user.id,
+        email=new_user.email,
+        first_name=new_user.first_name,
+        last_name=new_user.last_name,
+        full_name=new_user.full_name,
+        avatar_url=new_user.avatar_url,
+        job_title=new_user.job_title,
+        role=new_user.role,
+        is_active=new_user.is_active,
+        email_verified=new_user.email_verified
+    )
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(
+    user_id: str,
+    user: DBUser = Depends(require_permission("users", "delete")),
+    db: Session = Depends(get_db)
+):
+    """Supprime un utilisateur"""
+    
+    target = db.query(DBUser).filter(
+        DBUser.id == user_id,
+        DBUser.tenant_id == user.tenant_id
+    ).first()
+    
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    
+    if target.role == UserRole.OWNER.value:
+        raise HTTPException(status_code=403, detail="Impossible de supprimer le propriétaire")
+    
+    if target.id == user.id:
+        raise HTTPException(status_code=400, detail="Impossible de se supprimer soi-même")
+    
+    db.delete(target)
+    db.commit()
+    
+    return {"message": "Utilisateur supprimé"}
+
+
+# ============================================================
+# 🏢 TENANT MANAGEMENT
+# ============================================================
+
+@app.get("/api/tenant", response_model=TenantResponse)
+def get_tenant(
+    user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Récupère les infos de l'entreprise"""
+    tenant = db.query(DBTenant).filter(DBTenant.id == user.tenant_id).first()
+    return TenantResponse(
+        id=tenant.id,
+        name=tenant.name,
+        slug=tenant.slug,
+        email=tenant.email,
+        logo_url=tenant.logo_url,
+        primary_color=tenant.primary_color,
+        plan=tenant.plan,
+        subscription_status=tenant.subscription_status,
+        max_users=tenant.max_users,
+        max_agents=tenant.max_agents,
+        max_workflows=tenant.max_workflows,
+        max_executions_per_month=tenant.max_executions_per_month
+    )
+
+
+@app.put("/api/tenant", response_model=TenantResponse)
+def update_tenant(
+    data: TenantUpdate,
+    user: DBUser = Depends(require_permission("settings", "update")),
+    db: Session = Depends(get_db)
+):
+    """Met à jour les infos de l'entreprise"""
+    
+    tenant = db.query(DBTenant).filter(DBTenant.id == user.tenant_id).first()
+    
+    if data.name is not None:
+        tenant.name = data.name
+    if data.email is not None:
+        tenant.email = data.email
+    if data.phone is not None:
+        tenant.phone = data.phone
+    if data.address is not None:
+        tenant.address = data.address
+    if data.logo_url is not None:
+        tenant.logo_url = data.logo_url
+    if data.primary_color is not None:
+        tenant.primary_color = data.primary_color
+    if data.settings is not None:
+        tenant.settings = data.settings
+    
+    db.commit()
+    db.refresh(tenant)
+    
+    return TenantResponse(
+        id=tenant.id,
+        name=tenant.name,
+        slug=tenant.slug,
+        email=tenant.email,
+        logo_url=tenant.logo_url,
+        primary_color=tenant.primary_color,
+        plan=tenant.plan,
+        subscription_status=tenant.subscription_status,
+        max_users=tenant.max_users,
+        max_agents=tenant.max_agents,
+        max_workflows=tenant.max_workflows,
+        max_executions_per_month=tenant.max_executions_per_month
+    )
+
+
+# ============================================================
+# 📊 USAGE & BILLING
+# ============================================================
+
+@app.get("/api/usage/stats", response_model=UsageStatsResponse)
+def get_usage_stats(
+    user: DBUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Récupère les statistiques d'utilisation du mois en cours"""
+    
+    tenant = db.query(DBTenant).filter(DBTenant.id == user.tenant_id).first()
+    
+    # Période courante
+    now = datetime.utcnow()
+    current_period = now.strftime("%Y-%m")
+    
+    # Compter les usages
+    workflow_executions = db.query(DBUsageRecord).filter(
+        DBUsageRecord.tenant_id == tenant.id,
+        DBUsageRecord.billing_period == current_period,
+        DBUsageRecord.usage_type == "workflow_execution"
+    ).count()
+    
+    agent_calls = db.query(DBUsageRecord).filter(
+        DBUsageRecord.tenant_id == tenant.id,
+        DBUsageRecord.billing_period == current_period,
+        DBUsageRecord.usage_type == "agent_call"
+    ).count()
+    
+    mcp_tool_calls = db.query(DBUsageRecord).filter(
+        DBUsageRecord.tenant_id == tenant.id,
+        DBUsageRecord.billing_period == current_period,
+        DBUsageRecord.usage_type == "mcp_tool_call"
+    ).count()
+    
+    # Calculer les pourcentages
+    total_executions = workflow_executions + agent_calls
+    
+    return UsageStatsResponse(
+        current_period=current_period,
+        workflow_executions=workflow_executions,
+        agent_calls=agent_calls,
+        mcp_tool_calls=mcp_tool_calls,
+        limits={
+            "max_executions_per_month": tenant.max_executions_per_month,
+            "max_users": tenant.max_users,
+            "max_agents": tenant.max_agents,
+            "max_workflows": tenant.max_workflows
+        },
+        usage_percentage={
+            "executions": round(total_executions / tenant.max_executions_per_month * 100, 1) if tenant.max_executions_per_month > 0 else 0
+        }
+    )
+
+
+def record_usage(db: Session, tenant_id: str, user_id: str, usage_type: str, resource_id: str = None, resource_type: str = None, extra_data: dict = None):
+    """Helper pour enregistrer une utilisation"""
+    now = datetime.utcnow()
+    record = DBUsageRecord(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        usage_type=usage_type,
+        resource_id=resource_id,
+        resource_type=resource_type,
+        extra_data=extra_data or {},
+        billing_period=now.strftime("%Y-%m")
+    )
+    db.add(record)
+    db.commit()
 
 
 # ============================================================

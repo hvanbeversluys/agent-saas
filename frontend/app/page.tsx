@@ -1,6 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useAuth } from "./contexts/AuthContext";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
 import Chat from "./components/Chat";
 import EmployeeWizard from "./components/EmployeeWizard";
 import WorkflowBuilder from "./components/WorkflowBuilder";
@@ -79,6 +82,9 @@ type BuilderView = "list" | "by-area";
 type UserTab = "dashboard" | "chat" | "my-workflows";
 
 export default function Home() {
+  const { user, tenant, isAuthenticated, isLoading: authLoading, logout } = useAuth();
+  const router = useRouter();
+  
   const [mode, setMode] = useState<UserMode>("user");
   const [builderTab, setBuilderTab] = useState<BuilderTab>("employees");
   const [builderView, setBuilderView] = useState<BuilderView>("by-area");
@@ -94,7 +100,6 @@ export default function Home() {
   const [showWizard, setShowWizard] = useState(false);
   const [showWorkflowBuilder, setShowWorkflowBuilder] = useState(false);
   const [editingWorkflow, setEditingWorkflow] = useState<Workflow | null>(null);
-
 
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -221,7 +226,9 @@ export default function Home() {
               <span className="text-3xl">🏭</span>
               <div>
                 <h1 className="text-xl font-bold text-white">Agent SaaS</h1>
-                <p className="text-xs text-slate-400">Vos employés virtuels</p>
+                <p className="text-xs text-slate-400">
+                  {tenant?.name || "Vos employés virtuels"}
+                </p>
               </div>
             </div>
 
@@ -247,6 +254,44 @@ export default function Home() {
               >
                 🏗️ Constructeur
               </button>
+            </div>
+
+            {/* User Menu */}
+            <div className="flex items-center gap-4">
+              {isAuthenticated && user ? (
+                <>
+                  <Link
+                    href="/settings"
+                    className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors"
+                  >
+                    <div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-500 rounded-full flex items-center justify-center text-white text-sm font-bold">
+                      {user.first_name?.charAt(0) || user.email.charAt(0).toUpperCase()}
+                    </div>
+                    <span className="text-sm hidden md:block">{user.full_name || user.email}</span>
+                  </Link>
+                  <button
+                    onClick={() => logout()}
+                    className="text-slate-400 hover:text-red-400 transition-colors text-sm"
+                  >
+                    Déconnexion
+                  </button>
+                </>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <Link
+                    href="/login"
+                    className="px-4 py-2 text-slate-400 hover:text-white transition-colors text-sm"
+                  >
+                    Connexion
+                  </Link>
+                  <Link
+                    href="/register"
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors text-sm"
+                  >
+                    Essai gratuit
+                  </Link>
+                </div>
+              )}
             </div>
           </div>
         </div>
